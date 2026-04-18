@@ -26,11 +26,30 @@ ecosystem.
 ```
 agent-guidelines/
 ├── README.md                         ← This file (master index)
-├── 00-research-foundation.md         ← 24 arXiv papers with full citations
-├── 01-universal-architecture.md      ← Cross-language architectural patterns (28 sections)
-├── 02-authentication.md              ← Auth reference: API keys, OAuth PKCE, Bedrock, Vertex
-├── 03-reference-implementations.md   ← Working agents in Python/TypeScript/Rust/Go/Kotlin
-├── 04-todo-task-management.md        ← Todo/Task CRUD, storage, state machines, dependency DAGs, visualization
+├── 00-research-foundation.md         ← 25 arXiv papers with full citations
+│
+├── 01-overview.md                    ← Universal architecture index + reading paths
+├── 01-core-runtime.md                ← §1–4: Agent runtime, component inventory, multi-provider
+├── 01-prompts-permissions.md         ← §5–6: System prompt construction, 6-mode permission system
+├── 01-memory-rag-knowledge.md        ← §7–9: Memory tiers (CoALA), memdir, RAG pipelines, KG
+├── 01-event-driven-multiagent.md     ← §10–11: Event sourcing, CQRS, local multi-agent
+├── 01-advanced-patterns.md           ← §12–14: Self-improvement, session persistence, prompts
+├── 01-config-infra-reference.md      ← §15–18: Config schema, Docker infra, research papers
+├── 01-planning-hooks.md              ← §19–20: Planning mode, hook system (27+ events)
+├── 01-sessions-cost-ide.md           ← §21–23: Session JSONL, cost tracking, IDE integration
+├── 01-distributed-agents.md          ← §24: A2A protocol, Agent Card, JWT auth
+├── 01-extensions-sdk-mcp.md          ← §25–28: LSP, plugin system, SDK API, MCP (6 transports)
+│
+├── 02-auth-overview-apikey.md        ← §1–3: Auth overview, API key patterns
+├── 02-auth-oauth-token-keychain.md   ← §4–6: OAuth 2.0 PKCE, token management, keychain storage
+├── 02-auth-cloud-api-reference.md    ← §7–13: Bedrock, Vertex, multi-cloud, error handling
+├── 02-auth-multiprovider.md          ← §14: Multi-provider routing and fallback
+│
+├── 03-minimal-agents.md              ← §1–2: Minimal working agents (Python/TS/Rust/Go/Kotlin)
+├── 03-production-agents.md           ← §3–4: Full REPL agent, streaming, MCP integration
+├── 03-utilities-mcp-checklist.md     ← §5–13: Utilities, MCP server, production checklist
+│
+├── 04-todo-task-management.md        ← Todo/Task CRUD, storage, state machines, dependency DAGs
 │
 ├── cpp23/                            ← C++23 implementation (12 files)
 │   ├── 00-index.md                   ← C++23 quick-start and package overview
