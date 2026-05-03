@@ -586,4 +586,6 @@ fi
 
 ---
 
+**See also:** [Clear-Context-and-Execute · AskUserQuestion · Hooks Full Reference →](01-clear-context-plan-user-interaction.md) — source-verified deep dive into the clear-context workflow, AskUserQuestion schema, all user-interaction tools, and complete hook dispatch implementation guide.
+
 *[← Config, Infra & Reference](01-config-infra-reference.md) | [Next: Sessions, Cost & IDE →](01-sessions-cost-ide.md)*

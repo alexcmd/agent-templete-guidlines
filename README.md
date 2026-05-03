@@ -14,10 +14,10 @@ session persistence, and prompt engineering — using the best idiomatic approac
 ecosystem.
 
 **Source material analyzed:**
-- [Claude Code (TypeScript)](../claude-code/) — 21-section system prompt, compaction, REPL, concurrent tool execution (10×)
-- [Gemini CLI (TypeScript)](../gemini-cli/) — 1M context, 7-strategy model routing, LLM loop detection, tool output masking, A2A server
-- [Claw Code (Rust)](../claw-code/) — 9-crate workspace, 43 tools, A2A, worker lifecycle, recovery recipes
-- [Claurst (Rust)](https://github.com/Kuberwastaken/claurst) — 12-crate workspace, 35+ providers, managed-agent orchestration, AutoDream memory
+- [Claude Code (TypeScript)](../claude-code/src/) — swarm multi-backend (tmux/iTerm2/in-process), bridge remote sessions, 8-layer settings, bash security classifier, worktree isolation, QueryGuard, shell snapshot system
+- [Gemini CLI (TypeScript)](../gemini-cli/) — 1M context, 7-strategy model routing, LLM loop detection, tool output masking, A2A server, PTY/xterm headless, VS Code extension companion
+- [Claw Code (Python+Rust)](../claw-code/) — mirrored execution model, streaming typed events, frozen dataclass state, deterministic routing
+- [Claurst (Rust)](../claurst/) — 35+ providers, cross-provider tool abstraction, managed-agent orchestration, AutoDream memory, DAP integration
 
 ---
 
@@ -33,12 +33,15 @@ agent-guidelines/
 ├── 01-prompts-permissions.md         ← §5–6: System prompt construction, 6-mode permission system
 ├── 01-memory-rag-knowledge.md        ← §7–9: Memory tiers (CoALA), memdir, RAG pipelines, KG
 ├── 01-event-driven-multiagent.md     ← §10–11: Event sourcing, CQRS, local multi-agent
-├── 01-advanced-patterns.md           ← §12–14: Self-improvement, session persistence, prompts
+├── 01-advanced-patterns.md           ← §12–23: Self-improvement, QueryGuard, token budget, read-only validation, session storage
 ├── 01-config-infra-reference.md      ← §15–18: Config schema, Docker infra, research papers
-├── 01-planning-hooks.md              ← §19–20: Planning mode, hook system (27+ events)
+├── 01-planning-hooks.md              ← §19–20: Planning mode, hook system (30+ events)
 ├── 01-sessions-cost-ide.md           ← §21–23: Session JSONL, cost tracking, IDE integration
 ├── 01-distributed-agents.md          ← §24: A2A protocol, Agent Card, JWT auth
 ├── 01-extensions-sdk-mcp.md          ← §25–28: LSP, plugin system, SDK API, MCP (6 transports)
+├── 01-os-shell-integration.md        ← §29–35: PTY, subprocess, bash risk classification, background processes, OS signals
+├── 01-external-editor-plan-review.md ← External editor blocking (VSCode/vim), plan review workflow, hook-based review gates
+├── 01-blocking-waiting-mechanisms.md ← Complete taxonomy of all 8 blocking categories; accessibility matrix for skills/hooks/plugins/agents
 │
 ├── 02-auth-overview-apikey.md        ← §1–3: Auth overview, API key patterns
 ├── 02-auth-oauth-token-keychain.md   ← §4–6: OAuth 2.0 PKCE, token management, keychain storage
@@ -50,6 +53,23 @@ agent-guidelines/
 ├── 03-utilities-mcp-checklist.md     ← §5–13: Utilities, MCP server, production checklist
 │
 ├── 04-todo-task-management.md        ← Todo/Task CRUD, storage, state machines, dependency DAGs
+│
+├── 05-dap-debug-integration.md       ← DAP: Debug Adapter Protocol (Python/Node/Rust/Go/Java)
+├── 05-web-integration.md             ← Web fetch/search: SSRF prevention, rate limiting, HTML→markdown, citations
+│
+├── 06-swarm-backends.md              ← Swarm: tmux/iTerm2/in-process backends, file IPC mailbox, permission sync
+│
+├── claude-code-extensions/           ← Claude Code extension development (7 files, deep source analysis)
+│   ├── 00-index.md                   ← Master index: 5 extension types, quick-start by use case
+│   ├── 01-skills-commands.md         ← Skills: frontmatter, shell injection, conditional/dynamic activation
+│   ├── 02-agents.md                  ← Agents: all frontmatter fields, memory, worktree isolation
+│   ├── 03-hooks.md                   ← Hooks: all 27 events, 4 types, full I/O schemas
+│   ├── 04-plugins.md                 ← Plugins: manifest format, lifecycle, marketplace, built-in API
+│   ├── 05-mcp-servers.md             ← MCP: 6 transports, OAuth, resource support, writing servers
+│   ├── 06-settings-permissions.md    ← Settings hierarchy, permission rule syntax, permission modes
+│   ├── 07-hidden-techniques.md       ← Undocumented: asyncRewake, once-hooks, dynamic skills, agent memory
+│   ├── 08-mcp-registration-deep.md   ← All 7 registration paths, 4 plugin formats, enterprise policy, .mcp.json traversal
+│   └── 09-mcp-workflow-internals.md  ← Connection lifecycle, tool wrapping, OAuth flow, MCPB bundles, elicitation
 │
 ├── cpp23/                            ← C++23 implementation (12 files)
 │   ├── 00-index.md                   ← C++23 quick-start and package overview
@@ -308,7 +328,7 @@ CLI override → 429/529 fallback → default.
 Two mechanisms: **tool-based** (EnterPlanMode/ExitPlanMode tools, permission enforcement, plan file, user approval gate) for interactive agents; **extended thinking** (API-level, ephemeral, no approval gate) for automated pipelines. Tool-based plan mode enforces read-only at the permission layer — prompt instructions alone are not sufficient. For Manager-Executor topologies, use a ScratchpadGate to block write tools until the manager emits an unlock phrase in its output stream.
 
 ### 13. Hooks Lifecycle
-27+ hook event types (PreToolUse, PostToolUse, SessionStart, PreCompact, PermissionRequest, etc.). Four hook types: command (shell stdin/stdout JSON), http (webhook POST), prompt (LLM-evaluated), agent (sub-agent verifier). PreToolUse hooks can ALLOW, DENY, ASK, or replace the tool input. Execution is sequential within a matcher group; first non-allow result wins.
+30+ hook event types (PreToolUse, PostToolUse, SessionStart, PreCompact, PermissionRequest, etc.). Four hook types: command (shell stdin/stdout JSON), http (webhook POST), prompt (LLM-evaluated), agent (sub-agent verifier). PreToolUse hooks can ALLOW, DENY, ASK, or replace the tool input. Execution is sequential within a matcher group; first non-allow result wins.
 
 ### 14. Session JSONL with Branching
 Every message has a `parentUuid` forming a linked list. Fork at any message to create a conversation branch — the branch is a new `.jsonl` file with the ancestor chain replayed. Sessions are indexed by `sha256(realpath(cwd))[:16]`. Archive after 90 days; auto-delete after 365. Use SQLite index for session listing at scale.
@@ -330,6 +350,27 @@ A public SDK exposes: `createSession()`, `resumeSession()`, `forkSession()`, `qu
 
 ### 20. MCP Complete Reference
 6 transport types (stdio, HTTP, SSE, WebSocket, SDK in-process, managed proxy). Initialization: `initialize` → `initialized` → `tools/list`. Tool naming: `mcp__{server}__{tool}` with underscore normalization. Three resource types: tools (callable), resources (file-like), prompts (templates). OAuth 2.0 via metadata discovery. Status lifecycle: pending → connected → needs-auth → failed → disabled.
+
+### 21. OS & Shell Integration
+Two shell execution modes: **PTY** (interactive commands, color output, `isatty` checks) and **direct subprocess** (scripts, pipelines). Pre-execution bash risk classification (Safe/Moderate/Risky/Dangerous/Forbidden) prevents dangerous commands before they run. Track process groups (negative PID) to kill entire subprocess trees. Session-scoped background process registry with log files in validated tmpDir. Shell snapshot: capture environment once per session, source on every command for consistency. Strip ANSI codes + truncate to 50KB before injecting shell output into LLM context. See: `01-os-shell-integration.md`.
+
+### 22. DAP (Debug Adapter Protocol)
+Agents act as DAP **clients** — spawn language-specific adapters (debugpy, dlv, lldb-vscode, node-inspect) as subprocesses and communicate via Content-Length JSON-RPC (same framing as LSP). Standard init sequence: `initialize` → `launch/attach` → wait for `initialized` event → `setBreakpoints` → `configurationDone`. Expose as a single `debug` tool with discriminated union for operations (launch, attach, set_breakpoint, state, evaluate, step_over, stop). Check `DapCapabilities` before using optional features. Timeout all requests at 10s. See: `05-dap-debug-integration.md`.
+
+### 23. Web Integration
+Block SSRF by resolving hostnames and rejecting private IPs (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x). Rate-limit per hostname (10 req/60s, LRU window). Transform HTML → markdown, JSON → pretty-print, binary → base64. Normalize GitHub blob URLs to raw.githubusercontent.com. Truncate to 100KB before injecting into context. Cache responses 15 min (LRU, 200 entries). Insert citation markers at byte positions (not char positions). See: `05-web-integration.md`.
+
+### 24. Swarm Multi-Backend
+Register backends (tmux, iTerm2, in-process) via self-registering modules to avoid circular deps. Use `AsyncLocalStorage` for in-process teammate context isolation (each async call tree gets its own context without globals). File-based mailbox with directory-level lockfile for cross-process IPC. Sequential spawn lock (Mutex) in tmux/iTerm2 prevents race conditions. Permission routing: in-process uses direct leader queue; pane-based uses file IPC (pending/resolved dirs). Per-agent git worktrees with `--no-checkout` + sparse paths. `BoundedUUIDSet` (FIFO + Set) for message deduplication on history replay. See: `06-swarm-backends.md`.
+
+### 25. 8-Layer Settings Hierarchy
+Highest to lowest: Remote managed (MDM API cache) → MDM system policies (HKLM/plist) → Managed file (managed-settings.json + .d/ drop-ins) → User (~/.claude/settings.json) → Project (.claude/settings.json) → Local (.claude/settings.local.json, gitignored) → Flag (--settings CLI / SDK inline) → Plugin (allowlisted keys only). Arrays concatenate+deduplicate; objects deep-merge; undefined = delete (RFC 7396). Validate permission rules before schema parse to prevent one bad rule poisoning the whole file.
+
+### 26. QueryGuard: Concurrency Prevention
+Synchronous state machine (idle → dispatching → running) with generation counter prevents concurrent LLM queries. `forceEnd()` increments generation, invalidating all in-flight `finally` blocks from aborted queries. Implements `useSyncExternalStore` for reactive UI sync. See: `01-advanced-patterns.md §20`.
+
+### 27. Cross-Provider Tool Abstraction
+Define tools once; use `MessageTransformer` trait to convert from canonical (Anthropic) format to each provider's wire format at call time. The same tool definition works with Anthropic, OpenAI, Gemini, Bedrock, Azure, Ollama, etc. Provider registry resolves `"provider/model"` strings to provider instances at query time.
 
 ---
 
@@ -377,6 +418,54 @@ A public SDK exposes: `createSession()`, `resumeSession()`, `forkSession()`, `qu
 
 **MCP complete reference:**
 `01-universal-architecture.md` §28 (6 transports, OAuth, resources, prompts, agent-as-server)
+
+**OS/Shell integration (PTY, bash safety, background processes):**
+`01-os-shell-integration.md` §29–35
+
+**Debugging with DAP:**
+`05-dap-debug-integration.md` §1–6
+
+**Web fetch/search (SSRF, rate limiting, citations):**
+`05-web-integration.md` §1–7
+
+**Multi-agent swarm (tmux/iTerm2/in-process):**
+`06-swarm-backends.md` → `{lang}/07-multiagent.md`
+
+**Token budget & concurrent query safety:**
+`01-advanced-patterns.md` §20–22
+
+---
+
+## Integration Catalog
+
+Complete list of external system integrations covered in this guide:
+
+| Integration | File | Key Patterns |
+|-------------|------|-------------|
+| **File System** | `01-extensions-sdk-mcp.md` | Atomic writes, read-before-write, encoding detection, LRU cache |
+| **Shell/Subprocess** | `01-os-shell-integration.md` | PTY, process groups, bash risk classification, snapshot env |
+| **Background Processes** | `01-os-shell-integration.md §31` | Session-scoped registry, log files, SIGTERM→SIGKILL escalation |
+| **OS Signals** | `01-os-shell-integration.md §33` | SIGINT/SIGTERM/SIGHUP handlers, graceful shutdown sequence |
+| **LSP** | `01-extensions-sdk-mcp.md §25` | JSON-RPC stdio, lazy init, diagnostics cache, reconnect backoff |
+| **DAP** | `05-dap-debug-integration.md` | Content-Length framing, adapter lifecycle, capability negotiation |
+| **Web Fetch** | `05-web-integration.md` | SSRF prevention, rate limiting, HTML→markdown, citation grounding |
+| **Web Search** | `05-web-integration.md §6` | Provider abstraction, fallback chain, citation markers |
+| **IDE (VS Code)** | `01-sessions-cost-ide.md §23` | Extension companion, port file, diff view, bearer token auth |
+| **MCP** | `01-extensions-sdk-mcp.md §28` | 6 transports, OAuth, tool naming, resource types |
+| **A2A** | `01-distributed-agents.md §24` | Agent Card, JWT auth, streaming SSE, artifact reassembly |
+| **Git/Worktree** | `06-swarm-backends.md §7` | Per-agent worktrees, sparse checkout, worktree isolation |
+| **Swarm (tmux)** | `06-swarm-backends.md §2` | Pane splitting, spawn lock, shell init delay |
+| **Swarm (in-process)** | `06-swarm-backends.md §3` | AsyncLocalStorage isolation, independent AbortController |
+| **File IPC Mailbox** | `06-swarm-backends.md §4` | Directory lockfile, atomic writes, FIFO polling |
+| **Permission Sync** | `06-swarm-backends.md §5` | Leader queue (in-process) vs file IPC (pane-based) |
+| **Remote Bridge** | `01-sessions-cost-ide.md` | Poll loop, backoff, epoch mismatch recovery, flush gate |
+| **Telemetry/OTEL** | `01-config-infra-reference.md` | OpenTelemetry, OTLP exporters, event sequence counter |
+| **Settings (8 layers)** | `01-config-infra-reference.md` | MDM→managed→user→project→local→flag→plugin |
+| **Secure Storage** | `02-auth-oauth-token-keychain.md` | Keychain, fallback plaintext, prefetch pattern |
+| **Cost/Budget** | `01-sessions-cost-ide.md §22` | Per-agent attribution, SharedBudget atomic lock |
+| **Token Estimation** | `01-advanced-patterns.md §21` | Split-turn walk-back, cache exclusion formula |
+| **Read-Only Validation** | `01-advanced-patterns.md §22` | Flag allowlists, git/gh exfil guards, UNC detection |
+| **Session JSONL** | `01-advanced-patterns.md §23` | Per-file write queues, 100ms batching, tail-read metadata |
 
 ---
 

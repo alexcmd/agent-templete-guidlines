@@ -16,7 +16,9 @@
 | [01-advanced-patterns.md](01-advanced-patterns.md) | §12–14 | Self-improvement, session persistence, prompt engineering |
 | [01-config-infra-reference.md](01-config-infra-reference.md) | §15–18 | Config schema, Docker infra, research paper reference, cross-language decision guide |
 | [01-planning-hooks.md](01-planning-hooks.md) | §19–20 | Planning mode (ScratchpadGate, plan files), hook system (27+ events, wire protocol) |
+| [01-clear-context-plan-user-interaction.md](01-clear-context-plan-user-interaction.md) | §1–6 | Clear-context-and-execute pattern (source-verified), AskUserQuestion, all user-interaction tools, hooks full reference, skill implementation guide |
 | [01-sessions-cost-ide.md](01-sessions-cost-ide.md) | §21–23 | Session JSONL, cost tracking, IDE integration (LSP, delta context) |
+| [01-ide-integration.md](01-ide-integration.md) | §1–12 | IDE integration source-verified deep dive: lockfile protocol, MCP sse-ide/ws-ide transports, RPC (openDiff/closeTab), diff viewer hook, WSL path conversion, reproduction guide |
 | [01-distributed-agents.md](01-distributed-agents.md) | §24 | A2A protocol, Agent Card, distributed task delegation, JWT auth |
 | [01-extensions-sdk-mcp.md](01-extensions-sdk-mcp.md) | §25–28 | LSP client, plugin system, SDK API, MCP (6 transports, OAuth) |
 

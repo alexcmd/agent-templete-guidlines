@@ -31,35 +31,107 @@ export function getCommands(options: GetCommandsOptions): Command[] {
 
 ## Built-in CLI Commands
 
-Located in `src/commands/` — each is a `LocalCommand` or `LocalJSXCommand`.
+Located in `src/commands/` — each is a `LocalCommand`, `LocalJSXCommand`, or `PromptCommand`.
 
-| Command | Type | Description |
-|---------|------|-------------|
-| `/help` | local-jsx | Show help overlay |
-| `/clear` | local | Clear conversation history |
-| `/compact` | local | Manually compact conversation |
-| `/config` | local-jsx | Open config settings UI |
-| `/cost` | local | Show session cost breakdown |
-| `/doctor` | local-jsx | Diagnose configuration issues |
-| `/exit` | local | Exit Claude Code |
-| `/history` | local-jsx | Browse conversation history |
-| `/ide` | local-jsx | IDE integration settings |
-| `/init` | local | Initialize CLAUDE.md in project |
-| `/install-github-app` | local | Install GitHub App integration |
-| `/login` | local | Authenticate (OAuth) |
-| `/logout` | local | Remove credentials |
-| `/mcp` | local-jsx | MCP server management |
-| `/memory` | local-jsx | Memory system management |
-| `/model` | local | Show/switch model |
-| `/permissions` | local-jsx | Manage permission rules |
-| `/plugins` | local-jsx | Plugin management |
-| `/pr_comments` | local | Fetch GitHub PR comments |
-| `/reset` | local | Reset to fresh session |
-| `/resume` | local-jsx | Resume prior session |
-| `/review` | prompt | Review a pull request (skill) |
-| `/status` | local | Show connection status |
-| `/terminal-setup` | local | Configure terminal integration |
-| `/vim` | local | Toggle vim keybindings |
+Commands marked **Immediate** execute _during_ an active query (not queued). This is driven by `matchingCommand.immediate === true` in `REPL.tsx:3161`.
+
+### Core Commands
+
+| Command | Type | Immediate | Description |
+|---------|------|-----------|-------------|
+| `/add-dir` | prompt | | Add directory to CLAUDE.md search path |
+| `/btw` | local-jsx | ✓ | Quick note injected into active query |
+| `/clear` | local-jsx | ✓ | Clear conversation history and free context |
+| `/color` | local-jsx | ✓ | Change agent color |
+| `/commit` | local | | Create git commit |
+| `/commit-push-pr` | local | | Commit + push + create PR |
+| `/compact` | local | | Compact/summarize conversation (optional instructions) |
+| `/config` | local-jsx | | Edit settings UI |
+| `/context` | local | | Show/analyze context window |
+| `/cost` | local | | Show session cost tracking |
+| `/diff` | local | | Show git diff |
+| `/doctor` | local | | Run diagnostic checks |
+| `/effort` | local | | Set effort level |
+| `/exit` | local-jsx | ✓ | Exit TUI |
+| `/export` | local | | Export conversation |
+| `/fast` | local | | Toggle fast mode |
+| `/feedback` | local-jsx | ✓ | Send feedback |
+| `/files` | local | | List tracked files |
+| `/help` | local-jsx | ✓ | Show help and command list |
+| `/hooks` | local | | Manage hooks |
+| `/ide` | local | | IDE integration |
+| `/init` | local | | Initialize CLAUDE.md |
+| `/install-github-app` | local | | GitHub App setup |
+| `/install-slack-app` | local | | Slack app setup |
+| `/keybindings` | local-jsx | ✓ | Edit keybindings |
+| `/login` | local | | Authenticate (OAuth) |
+| `/logout` | local | | Sign out |
+| `/mcp` | local | | MCP server management |
+| `/memory` | local | | Session memory access |
+| `/mobile` | local-jsx | ✓ | Show mobile QR code |
+| `/model` | local-jsx | ✓ | Select model |
+| `/output-style` | local | | Output formatting |
+| `/permissions` | local | | Manage tool permissions |
+| `/plan` | local-jsx | ✓ | Toggle plan mode |
+| `/plugin` | local | | Plugin management |
+| `/pr-comments` | local | | PR comment handling |
+| `/privacy-settings` | local | | Privacy configuration |
+| `/rate-limit-options` | local | | Rate limit configuration |
+| `/release-notes` | local | | Show changelog |
+| `/rename` | local | | Rename files |
+| `/resume` | local-jsx | ✓ | Resume previous session |
+| `/review` | local | | Code review |
+| `/rewind` | local | | Undo/rewind operations |
+| `/sandbox-toggle` | local | | Toggle sandbox mode |
+| `/security-review` | local | | Security analysis |
+| `/session` | local-jsx | ✓ | Show remote session QR/URL |
+| `/share` | local | | Share conversation |
+| `/skills` | local | | List available skills |
+| `/stats` | local | | Show statistics |
+| `/status` | local | | Show status |
+| `/statusline` | local | | Status line configuration |
+| `/stickers` | local | | Sticker management |
+| `/summary` | local | | Summarize conversation |
+| `/tag` | local | | Tag management |
+| `/terminalSetup` | local | | Terminal configuration |
+| `/theme` | local-jsx | ✓ | Change terminal theme |
+| `/upgrade` | local | | Upgrade CLI |
+| `/usage` | local | | Show usage info |
+| `/vim` | local-jsx | ✓ | Toggle vim mode |
+
+### Feature-Gated Commands
+
+| Command | Feature Flag | Description |
+|---------|-------------|-------------|
+| `/brief` | `KAIROS` | — |
+| `/bridge` | `BRIDGE_MODE` | Remote control bridge |
+| `/buddy` | `BUDDY` | — |
+| `/bughunter` | — | Bug detection |
+| `/fork` | `FORK_SUBAGENT` | Fork as subagent |
+| `/peers` | `UDS_INBOX` | — |
+| `/proactive` | `PROACTIVE`/`KAIROS` | — |
+| `/remote-setup` | `CCR_REMOTE_SETUP` | — |
+| `/subscribe-pr` | `KAIROS_GITHUB_WEBHOOKS` | — |
+| `/torch` | `TORCH` | — |
+| `/ultraplan` | `ULTRAPLAN` | — |
+| `/workflows` | `WORKFLOW_SCRIPTS` | Workflow scripts |
+
+### ANT-Internal Commands
+
+Commands only available to Anthropic employees:
+`/ant-trace`, `/autofix-pr`, `/backfill-sessions`, `/break-cache`, `/env`, `/good-claude`, `/issue`, `/mock-limits`, `/oauth-refresh`, `/onboarding`, `/perf-issue`, `/reset-limits`, `/teleport`, `/version`
+
+---
+
+### Remote-Safe Commands
+
+Commands that work in `--remote` mode:
+`/session`, `/exit`, `/clear`, `/help`, `/theme`, `/color`, `/vim`, `/cost`, `/usage`, `/btw`, `/feedback`, `/plan`, `/keybindings`, `/statusline`, `/stickers`, `/mobile`
+
+### Bridge-Safe Commands
+
+Commands that work via the Remote Control bridge (from mobile/web):
+`/compact`, `/clear`, `/cost`, `/summary`, `/files`
 
 ---
 

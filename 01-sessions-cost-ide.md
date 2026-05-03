@@ -297,6 +297,8 @@ def context_budget_check(messages: list, tools: list, model: str, system_prompt_
 
 ## 23. IDE & Editor Integration
 
+> **Source-verified deep dive:** See [01-ide-integration.md](01-ide-integration.md) for the complete Claude Code implementation: lockfile protocol, `sse-ide`/`ws-ide` MCP transports, `callIdeRpc()`, diff viewer hook, WSL path conversion, and reproduction guide in Python/Kotlin/C++23.
+
 ### 23.1 Integration Patterns
 
 Two patterns exist for connecting an agent to an IDE:

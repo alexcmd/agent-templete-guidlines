@@ -11,8 +11,8 @@ This documentation set reverse-engineers Claude Code from source to give you eve
 | 03 | [Core Data Structures](./03-data-structures.md) | All key TypeScript types, interfaces, and state shapes |
 | 04 | [Tools System](./04-tools-system.md) | Tool interface, all built-in tools, permission model |
 | 05 | [Agent Loop & Query Engine](./05-agent-loop.md) | QueryEngine, query.ts, compaction, transitions |
-| 06 | [Commands & Skills](./06-commands-skills.md) | Slash commands, skills, plugin commands |
-| 07 | [Memory & Context](./07-memory-context.md) | Memory directory, system prompt assembly, context injection |
+| 06 | [Commands & Skills](./06-commands-skills.md) | Slash commands (~90), immediate vs queued, remote/bridge-safe sets, skills, plugin commands |
+| 07 | [Memory & Context](./07-memory-context.md) | Memory directory, system prompt assembly, context injection, prompt cache system (getCacheControl, cache_edits, break detection, session latches) |
 | 08 | [Permissions & Hooks](./08-permissions-hooks.md) | Permission modes, rules, lifecycle hooks |
 | 09 | [Configuration System](./09-configuration.md) | Settings hierarchy, env vars, MDM, feature flags |
 | 10 | [Plugin System](./10-plugin-system.md) | Plugin manifest, lifecycle, MCP integration |
@@ -21,6 +21,7 @@ This documentation set reverse-engineers Claude Code from source to give you eve
 | 13 | [Use Cases & Scenarios](./13-use-cases.md) | All major usage scenarios with flow diagrams |
 | 14 | [Reproduction Blueprint](./14-reproduction-blueprint.md) | Step-by-step guide to build a domain-specific agent |
 | 15 | [Diagrams](./15-diagrams.md) | ASCII architecture, sequence, and component diagrams |
+| 16 | [Complete Prompt Documentation](./16-prompts-complete.md) | Every prompt in Claude Code — system prompt sections, all 27 tool descriptions, 5 built-in agent system prompts, compaction/coordinator/proactive prompts, service prompts (SessionMemory, MagicDocs, ExtractMemories), buddy prompt, cache strategy, and dynamic combination matrix |
 
 ## Quick Summary
 

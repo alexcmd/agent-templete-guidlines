@@ -212,8 +212,151 @@ The main system prompt is built from these sections in order:
 ### Cache Optimization
 
 Claude Code splits the system prompt at `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`:
-- Everything before the boundary uses `cache_control: { type: 'ephemeral' }` with `scope: 'global'` — can be shared across users/organizations (for Anthropic-controlled prompts)
-- Everything after uses per-session caching
+- Everything before the boundary uses `cache_control: { type: 'ephemeral', scope: 'global' }` — shared across all sessions and users (Anthropic-controlled prompts only)
+- Everything after uses per-session caching (`scope` omitted)
+
+---
+
+## Prompt Cache System
+
+All details sourced from `src/services/api/claude.ts`, `src/utils/api.ts`, and `src/bootstrap/state.ts`.
+
+### `getCacheControl()` — `services/api/claude.ts:358`
+
+Every API message block gets a `cache_control` directive built by this function:
+
+```typescript
+export function getCacheControl({ scope, querySource } = {}): {
+  type: 'ephemeral'
+  ttl?: '1h'
+  scope?: CacheScope
+} {
+  return {
+    type: 'ephemeral',
+    ...(should1hCacheTTL(querySource) && { ttl: '1h' }),
+    ...(scope === 'global' && { scope }),
+  }
+}
+```
+
+**TTL options:**
+- Default: `5m` (omitted, API default)
+- Extended: `1h` — eligible users only (ANT employees, Claude AI subscribers not in overage, Bedrock with `ENABLE_PROMPT_CACHING_1H_BEDROCK`, GrowthBook gate `tengu_prompt_cache_1h_config`)
+
+**Eligibility is latched** at session start in `bootstrap/state.ts:225` (`promptCache1hEligible`). This prevents a mid-session eligibility change (e.g., entering overage) from switching TTL and busting the cache.
+
+**Cache scopes:**
+
+| Scope | Meaning |
+|-------|---------|
+| `'global'` | Shared across all sessions and users (static system prompt blocks) |
+| `'org'` | Organization-level sharing |
+| `null` (omitted) | Per-session only |
+
+### System Prompt Split Caching — `utils/api.ts:321`
+
+`splitSysPromptPrefix()` divides the system prompt at `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`:
+
+```
+[Before boundary]  → cache_control { type:'ephemeral', scope:'global' }
+[After boundary]   → cache_control { type:'ephemeral' }  (no scope)
+```
+
+The strategy for global caching (`tool_based` vs `system_prompt`) is selected by `shouldUseGlobalCacheScope()`. When MCP tools are present, the strategy switches to `tool_based` (tools are the stable prefix) rather than `system_prompt`.
+
+### Cache Editing (`cache_edits`) — `services/api/claude.ts:3050`
+
+When the context window fills up, stale cached content can be deleted without invalidating the rest of the cache prefix:
+
+```typescript
+type CacheEditsBlock = {
+  type: 'cache_edits'
+  edits: { type: 'delete'; cache_reference: string }[]
+}
+```
+
+**How it works:**
+1. `cache_reference` fields are added to `tool_result` blocks inside the cached prefix
+2. A `cache_edits` block with `{ type: 'delete', cache_reference }` entries is inserted into the last user message
+3. Deduplication prevents the same reference being deleted twice across multiple `cache_edits` blocks
+4. Previously-pinned `cache_edits` are re-inserted at their original positions in the message array
+5. **Constraint:** a `cache_reference` must appear _before_ the last `cache_control` marker in message order
+
+The `cacheEditingHeaderLatched` flag in `bootstrap/state.ts:237` ensures the beta header is only set once — toggling it mid-session would bust the cache.
+
+### Cache Break Detection — `services/api/promptCacheBreakDetection.ts`
+
+Tracks a hash of the full cache-relevant API state on each request and logs when a change would bust the cache. Monitored fields:
+
+```typescript
+type PreviousState = {
+  systemHash: number          // System prompt content
+  cacheControlHash: number    // scope/TTL values
+  toolsHash: number           // Tool schema set
+  perToolHashes: Record<string, number>
+  model: string
+  fastMode: boolean
+  globalCacheStrategy: string // 'tool_based' | 'system_prompt'
+  betas: string[]             // Beta headers
+  autoModeActive: boolean
+  isUsingOverage: boolean     // Latched — won't flip mid-session
+  cachedMCEnabled: boolean
+  effortValue: string
+  extraBodyHash: number
+  callCount: number
+  cacheDeletionsPending: boolean
+}
+```
+
+### Bootstrap State — Session Cache Latches
+
+`bootstrap/state.ts` holds session-stable cache variables that are **set once and never changed** to avoid mid-session cache busts:
+
+| State field | Line | Purpose |
+|-------------|------|---------|
+| `promptCache1hEligible` | 225 | 1h TTL eligibility — latched on first eval |
+| `promptCache1hAllowlist` | 221 | GrowthBook allowlist — cached for session |
+| `afkModeHeaderLatched` | 229 | Sticky-on: AFK_MODE_BETA_HEADER |
+| `fastModeHeaderLatched` | 233 | Sticky-on: FAST_MODE_BETA_HEADER |
+| `cacheEditingHeaderLatched` | 237 | Sticky-on: cache-editing beta header |
+| `thinkingClearLatched` | 242 | Sticky-on: thinking cache clear (>1h idle) |
+| `systemPromptSectionCache` | 203 | Map of section name → cached content |
+| `lastMainRequestId` | 248 | Last API requestId for cache eviction hints |
+| `lastApiCompletionTimestamp` | 252 | Correlates cache misses with idle time |
+
+**Latch pattern** — flags that are `false` by default and flip to `true` permanently when a feature is first used:
+
+```typescript
+// If fast mode is turned on mid-session, the beta header stays on
+// for the rest of the session (preventing a cache bust on toggle-off)
+if (isFastMode && !getFastModeHeaderLatched()) {
+  setFastModeHeaderLatched(true)
+}
+const includeFastHeader = isFastMode || getFastModeHeaderLatched()
+```
+
+### Session Memory Service — `services/SessionMemory/sessionMemory.ts`
+
+Auto-extracts key facts from the conversation and saves them to structured memory files. Gated by GrowthBook feature flag `tengu_session_memory`.
+
+- **Config source:** `tengu_sm_config` from GrowthBook (cached, may be stale across sessions)
+- **Thresholds:** init threshold (context window tokens), update threshold (tokens since last extraction), tool-call count between updates
+- **Extraction:** runs as a background forked subagent — does not block the main conversation turn
+
+### Token Accounting
+
+`bootstrap/state.ts:67` tracks cache token usage in `modelUsage`:
+
+```typescript
+type ModelUsage = {
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number      // Tokens served from cache
+  cacheCreationInputTokens: number  // Tokens written to cache
+}
+```
+
+Surfaced in `/cost` output.
 
 ---
 

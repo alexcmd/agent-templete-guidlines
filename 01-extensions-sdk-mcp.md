@@ -7,227 +7,590 @@ Part of the [Universal Agent Architecture](01-overview.md) series.
 ## 25. LSP Integration (Language Server Protocol)
 
 Agents act as **LSP clients** — they spawn language servers and query them to provide
-code intelligence (definitions, references, diagnostics, hover) as tool outputs. No
-agent studied acts as an LSP server itself.
+code intelligence (definitions, references, diagnostics, hover) as tool outputs.
 
 ### 25.1 Architecture
 
 ```
 Agent
   │
-  ▼ spawn subprocess
-Language Server (clangd, pyright, rust-analyzer, etc.)
-  │ stdin/stdout JSON-RPC (Content-Length framing)
+  ▼ spawn subprocess (lazy — on first file query)
+Language Server (clangd, pyright, rust-analyzer, typescript-language-server, …)
+  │  stdin/stdout  JSON-RPC 2.0  Content-Length framing
   ▼
-Agent LSP Client
-  ├── sends: initialize, textDocument/didOpen, textDocument/hover, ...
-  └── receives: publishDiagnostics notifications → injected into context
+LspClient (async reader loop running concurrently)
+  ├── pending: Map<id, Promise>   ← request/response correlation
+  └── diagnostics: Map<uri, Diagnostic[]>  ← notification cache (1-min TTL)
 ```
 
-**Transport:** Always stdio (subprocess). The agent spawns the language server as a child
-process and communicates via stdin/stdout using JSON-RPC 2.0 with HTTP-style
-`Content-Length:` framing headers.
+**Transport:** Always stdio. JSON-RPC 2.0 with `Content-Length: N\r\n\r\n` framing —
+identical to DAP (see `05-dap-debug-integration.md`).
+
+**Critical:** The server sends `publishDiagnostics` **notifications** at any time —
+interleaved with responses. A synchronous blocking reader will corrupt the stream.
+You must run a dedicated reader loop that routes messages to pending promises or the
+notification cache.
 
 ### 25.2 Supported LSP Methods
 
-| Category | Method | Use in agent |
-|----------|--------|-------------|
-| Lifecycle | `initialize` / `initialized` / `shutdown` | Session setup/teardown |
-| Diagnostics | `textDocument/publishDiagnostics` (notification) | Inject errors into context |
+| Category | Method | Agent use |
+|----------|--------|-----------|
+| Lifecycle | `initialize` / `initialized` / `shutdown` / `exit` | Session setup/teardown |
+| File sync | `textDocument/didOpen` / `didChange` / `didClose` | **Required before any query** |
+| Diagnostics | `textDocument/publishDiagnostics` (notification) | Cache and inject into context |
 | Navigation | `textDocument/definition` | Resolve symbol to declaration |
-| Navigation | `textDocument/references` | Find all usages of a symbol |
+| Navigation | `textDocument/references` | Find all usages |
 | Navigation | `textDocument/implementation` | Find concrete implementations |
-| Navigation | `textDocument/declaration` | Go to type declaration |
 | Symbols | `textDocument/documentSymbol` | File-level symbol tree |
 | Symbols | `workspace/symbol` | Project-wide symbol search |
-| Call hierarchy | `textDocument/prepareCallHierarchy` | Find callers/callees |
-| Call hierarchy | `callHierarchy/incomingCalls` | Who calls this function |
-| Call hierarchy | `callHierarchy/outgoingCalls` | What this function calls |
-| Hover | `textDocument/hover` | Type info, documentation |
+| Call hierarchy | `textDocument/prepareCallHierarchy` + `incomingCalls` / `outgoingCalls` | Callers/callees |
+| Hover | `textDocument/hover` | Type info + documentation |
 | Completion | `textDocument/completion` | Autocomplete suggestions |
-| Formatting | `textDocument/formatting` | Format a file |
+| Formatting | `textDocument/formatting` | Format a whole file |
+| Rename | `textDocument/rename` | Project-wide rename |
 
-### 25.3 LSP Tool Implementation
-
-Expose LSP capabilities as a single `lsp` agent tool with an `operation` parameter:
-
-```python
-LSP_TOOL = {
-    "name": "lsp",
-    "description": "Query the language server for code intelligence: definitions, references, diagnostics, hover info, symbols.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "operation": {
-                "type": "string",
-                "enum": ["go_to_definition", "find_references", "hover",
-                         "document_symbols", "workspace_symbols",
-                         "go_to_implementation", "incoming_calls", "outgoing_calls",
-                         "diagnostics", "format_document"]
-            },
-            "file_path": {"type": "string", "description": "Absolute path to the file"},
-            "line":      {"type": "integer", "description": "0-based line number"},
-            "character": {"type": "integer", "description": "0-based character offset"},
-            "query":     {"type": "string",  "description": "For workspace_symbols: search query"}
-        },
-        "required": ["operation", "file_path"]
-    }
-}
-```
-
-### 25.4 JSON-RPC Client (minimal Python implementation)
+### 25.3 Async LSP Client (Python)
 
 ```python
-import json, subprocess, threading
+import asyncio, json, re
+from pathlib import Path
 from typing import Any
 
+RESPONSE_TIMEOUT = 10.0   # seconds per request
+MAX_FILE_BYTES   = 10 * 1024 * 1024  # 10 MB — LSP servers choke on larger files
+
 class LspClient:
-    def __init__(self, command: list[str]):
-        self._proc = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    def __init__(self, command: list[str], root_uri: str):
+        self._command   = command
+        self._root_uri  = root_uri
+        self._seq       = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._diagnostics: dict[str, list[dict]] = {}   # uri → diagnostics
+        self._diag_ts:    dict[str, float]        = {}   # uri → timestamp
+        self._open_files: set[str]               = set()
+        self._caps: dict                         = {}   # server capabilities
+        self._proc: asyncio.subprocess.Process | None = None
+        self._reader_task: asyncio.Task | None         = None
+
+    async def start(self) -> None:
+        self._proc = await asyncio.create_subprocess_exec(
+            *self._command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        self._id = 0
-        self._lock = threading.Lock()
-
-    def _send(self, method: str, params: Any) -> Any:
-        self._id += 1
-        msg = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params}
-        body = json.dumps(msg).encode()
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode()
-        with self._lock:
-            self._proc.stdin.write(header + body)
-            self._proc.stdin.flush()
-            return self._read_response()
-
-    def _read_response(self) -> Any:
-        headers = {}
-        while True:
-            line = self._proc.stdout.readline().decode().strip()
-            if not line:
-                break
-            k, v = line.split(":", 1)
-            headers[k.strip().lower()] = v.strip()
-        length = int(headers["content-length"])
-        body = self._proc.stdout.read(length)
-        return json.loads(body).get("result")
-
-    def initialize(self, root_uri: str) -> None:
-        self._send("initialize", {
-            "rootUri": root_uri,
-            "capabilities": {"textDocument": {"hover": {"contentFormat": ["plaintext"]},
-                                               "publishDiagnostics": {}}},
-            "clientInfo": {"name": "agent-lsp-client", "version": "1.0"}
+        self._reader_task = asyncio.create_task(self._reader_loop())
+        result = await self._request("initialize", {
+            "rootUri": self._root_uri,
+            "capabilities": {
+                "textDocument": {
+                    "hover":            {"contentFormat": ["markdown", "plaintext"]},
+                    "publishDiagnostics": {"relatedInformation": True},
+                    "definition":       {"linkSupport": False},
+                    "references":       {},
+                    "documentSymbol":   {"hierarchicalDocumentSymbolSupport": True},
+                    "completion":       {"completionItem": {"snippetSupport": False}},
+                    "formatting":       {},
+                    "rename":           {"prepareSupport": True},
+                },
+                "workspace": {"symbol": {}},
+            },
+            "clientInfo": {"name": "agent-lsp-client", "version": "1.0"},
         })
-        self._notify("initialized", {})
+        self._caps = result.get("capabilities", {})
+        await self._notify("initialized", {})
 
-    def _notify(self, method: str, params: Any) -> None:
-        msg = {"jsonrpc": "2.0", "method": method, "params": params}
+    # ── reader loop: routes responses to pending futures, caches notifications ──
+
+    async def _reader_loop(self) -> None:
+        assert self._proc and self._proc.stdout
+        buf = b""
+        while True:
+            try:
+                chunk = await self._proc.stdout.read(4096)
+            except Exception:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                m = re.match(rb"Content-Length: (\d+)\r\n\r\n", buf)
+                if not m:
+                    break
+                length = int(m.group(1))
+                end = m.end() + length
+                if len(buf) < end:
+                    break
+                body = buf[m.end():end]
+                buf  = buf[end:]
+                try:
+                    msg = json.loads(body)
+                except json.JSONDecodeError:
+                    continue
+                self._dispatch(msg)
+
+    def _dispatch(self, msg: dict) -> None:
+        if "id" in msg and ("result" in msg or "error" in msg):
+            # Response to a request
+            fut = self._pending.pop(msg["id"], None)
+            if fut and not fut.done():
+                if "error" in msg:
+                    fut.set_exception(LspError(msg["error"]))
+                else:
+                    fut.set_result(msg.get("result"))
+        elif msg.get("method") == "textDocument/publishDiagnostics":
+            # Notification — cache it
+            params = msg.get("params", {})
+            uri = params.get("uri", "")
+            self._diagnostics[uri] = params.get("diagnostics", [])
+            self._diag_ts[uri] = asyncio.get_event_loop().time()
+
+    # ── send helpers ──
+
+    async def _request(self, method: str, params: Any) -> Any:
+        self._seq += 1
+        seq = self._seq
+        msg = {"jsonrpc": "2.0", "id": seq, "method": method, "params": params}
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[seq] = fut
+        await self._write(msg)
+        return await asyncio.wait_for(fut, timeout=RESPONSE_TIMEOUT)
+
+    async def _notify(self, method: str, params: Any) -> None:
+        await self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    async def _write(self, msg: dict) -> None:
+        assert self._proc and self._proc.stdin
         body = json.dumps(msg).encode()
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode()
-        with self._lock:
-            self._proc.stdin.write(header + body)
-            self._proc.stdin.flush()
+        frame = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+        self._proc.stdin.write(frame)
+        await self._proc.stdin.drain()
 
-    def go_to_definition(self, uri: str, line: int, char: int) -> list:
-        return self._send("textDocument/definition", {
-            "textDocument": {"uri": uri}, "position": {"line": line, "character": char}
+    # ── file synchronisation (REQUIRED before any per-file query) ──
+
+    async def open_file(self, path: str) -> None:
+        p = Path(path)
+        if p.stat().st_size > MAX_FILE_BYTES:
+            raise ValueError(f"File too large for LSP: {path}")
+        uri = p.as_uri()
+        if uri in self._open_files:
+            return
+        text = p.read_text(errors="replace")
+        lang = _language_id(p.suffix)
+        await self._notify("textDocument/didOpen", {
+            "textDocument": {"uri": uri, "languageId": lang, "version": 1, "text": text}
+        })
+        self._open_files.add(uri)
+        # Give the server time to index the file before querying
+        await asyncio.sleep(0.1)
+
+    async def sync_file(self, path: str, text: str, version: int) -> None:
+        uri = Path(path).as_uri()
+        await self._notify("textDocument/didChange", {
+            "textDocument": {"uri": uri, "version": version},
+            "contentChanges": [{"text": text}],  # full-document sync (simpler)
+        })
+
+    async def close_file(self, path: str) -> None:
+        uri = Path(path).as_uri()
+        self._open_files.discard(uri)
+        await self._notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    # ── queries ──
+
+    async def definition(self, path: str, line: int, char: int) -> list[dict]:
+        await self.open_file(path)
+        result = await self._request("textDocument/definition", {
+            "textDocument": {"uri": Path(path).as_uri()},
+            "position": {"line": line, "character": char},
+        })
+        return _as_list(result)
+
+    async def references(self, path: str, line: int, char: int) -> list[dict]:
+        await self.open_file(path)
+        return await self._request("textDocument/references", {
+            "textDocument": {"uri": Path(path).as_uri()},
+            "position": {"line": line, "character": char},
+            "context": {"includeDeclaration": True},
         }) or []
 
-    def hover(self, uri: str, line: int, char: int) -> str:
-        result = self._send("textDocument/hover", {
-            "textDocument": {"uri": uri}, "position": {"line": line, "character": char}
+    async def hover(self, path: str, line: int, char: int) -> str:
+        await self.open_file(path)
+        result = await self._request("textDocument/hover", {
+            "textDocument": {"uri": Path(path).as_uri()},
+            "position": {"line": line, "character": char},
         })
-        if result and "contents" in result:
-            c = result["contents"]
-            return c.get("value", c) if isinstance(c, dict) else str(c)
-        return ""
+        if not result:
+            return ""
+        c = result.get("contents", "")
+        if isinstance(c, dict):
+            return c.get("value", "")
+        if isinstance(c, list):
+            return "\n".join(i.get("value", i) if isinstance(i, dict) else i for i in c)
+        return str(c)
 
-    def document_symbols(self, uri: str) -> list:
-        return self._send("textDocument/documentSymbol", {"textDocument": {"uri": uri}}) or []
+    async def document_symbols(self, path: str) -> list[dict]:
+        await self.open_file(path)
+        return await self._request("textDocument/documentSymbol",
+                                   {"textDocument": {"uri": Path(path).as_uri()}}) or []
 
-    def shutdown(self):
-        self._send("shutdown", None)
-        self._notify("exit", None)
-        self._proc.terminate()
+    async def workspace_symbols(self, query: str) -> list[dict]:
+        return await self._request("workspace/symbol", {"query": query}) or []
+
+    async def get_diagnostics(self, path: str, max_age_s: float = 60.0) -> list[dict]:
+        """Return cached diagnostics if fresh, else trigger a re-index by reopening."""
+        uri = Path(path).as_uri()
+        age = asyncio.get_event_loop().time() - self._diag_ts.get(uri, 0)
+        if age > max_age_s:
+            # Force server to re-analyse: close + reopen
+            await self.close_file(path)
+            self._open_files.discard(uri)
+            await self.open_file(path)
+            await asyncio.sleep(0.5)  # allow publishDiagnostics to arrive
+        return self._diagnostics.get(uri, [])
+
+    async def format(self, path: str, tab_size: int = 4, insert_spaces: bool = True) -> list[dict]:
+        await self.open_file(path)
+        return await self._request("textDocument/formatting", {
+            "textDocument": {"uri": Path(path).as_uri()},
+            "options": {"tabSize": tab_size, "insertSpaces": insert_spaces},
+        }) or []
+
+    # ── lifecycle ──
+
+    async def shutdown(self) -> None:
+        try:
+            await self._request("shutdown", None)
+            await self._notify("exit", None)
+        except Exception:
+            pass
+        if self._reader_task:
+            self._reader_task.cancel()
+        if self._proc:
+            self._proc.kill()
+
+
+class LspError(Exception):
+    pass
+
+def _as_list(r: Any) -> list:
+    if r is None:       return []
+    if isinstance(r, list): return r
+    return [r]
+
+def _language_id(suffix: str) -> str:
+    return {
+        ".py": "python", ".ts": "typescript", ".tsx": "typescriptreact",
+        ".js": "javascript", ".jsx": "javascriptreact",
+        ".rs": "rust", ".go": "go", ".cpp": "cpp", ".c": "c",
+        ".java": "java", ".cs": "csharp", ".rb": "ruby",
+        ".kt": "kotlin", ".swift": "swift", ".zig": "zig",
+    }.get(suffix, "plaintext")
 ```
 
-### 25.5 LSP Server Configuration (Plugin Manifest)
+### 25.4 TypeScript Async Client
 
-```json
-{
-  "lspServers": {
-    "python": {
-      "command": "pyright-langserver",
-      "args": ["--stdio"],
-      "languages": ["python"],
-      "file_extensions": [".py", ".pyi"],
-      "root_patterns": ["pyproject.toml", "setup.py", "requirements.txt"]
-    },
-    "rust": {
-      "command": "rust-analyzer",
-      "args": [],
-      "languages": ["rust"],
-      "file_extensions": [".rs"],
-      "root_patterns": ["Cargo.toml"]
-    },
-    "typescript": {
-      "command": "typescript-language-server",
-      "args": ["--stdio"],
-      "languages": ["typescript", "javascript"],
-      "file_extensions": [".ts", ".tsx", ".js", ".jsx"],
-      "root_patterns": ["tsconfig.json", "package.json"]
+```typescript
+import { spawn, ChildProcess } from 'child_process';
+
+const RESPONSE_TIMEOUT_MS = 10_000;
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+export class LspClient {
+  private proc: ChildProcess;
+  private seq = 0;
+  private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private diagnostics = new Map<string, LspDiagnostic[]>();
+  private diagTimestamps = new Map<string, number>();
+  private openFiles = new Set<string>();
+  private buf = Buffer.alloc(0);
+  caps: LspCapabilities = {};
+
+  constructor(command: string[]) {
+    this.proc = spawn(command[0], command.slice(1), {
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    this.proc.stdout!.on('data', (chunk: Buffer) => {
+      this.buf = Buffer.concat([this.buf, chunk]);
+      this.drain();
+    });
+    this.proc.on('exit', () => {
+      for (const { reject } of this.pending.values()) {
+        reject(new Error('LSP server exited'));
+      }
+      this.pending.clear();
+    });
+  }
+
+  private drain(): void {
+    while (true) {
+      const header = this.buf.toString('utf-8', 0, Math.min(200, this.buf.length));
+      const m = header.match(/Content-Length: (\d+)\r\n\r\n/);
+      if (!m) break;
+      const headerEnd = this.buf.indexOf('\r\n\r\n') + 4;
+      const length = parseInt(m[1]);
+      if (this.buf.length < headerEnd + length) break;
+      const body = this.buf.slice(headerEnd, headerEnd + length);
+      this.buf = this.buf.slice(headerEnd + length);
+      this.dispatch(JSON.parse(body.toString('utf-8')));
     }
+  }
+
+  private dispatch(msg: LspMessage): void {
+    if ('id' in msg && ('result' in msg || 'error' in msg)) {
+      const p = this.pending.get(msg.id as number);
+      if (!p) return;
+      this.pending.delete(msg.id as number);
+      if ('error' in msg) p.reject(new Error(JSON.stringify(msg.error)));
+      else p.resolve(msg.result);
+    } else if (msg.method === 'textDocument/publishDiagnostics') {
+      const { uri, diagnostics } = msg.params as { uri: string; diagnostics: LspDiagnostic[] };
+      this.diagnostics.set(uri, diagnostics);
+      this.diagTimestamps.set(uri, Date.now());
+    }
+  }
+
+  async request<T = unknown>(method: string, params: unknown): Promise<T> {
+    const id = ++this.seq;
+    const msg = JSON.stringify({ jsonrpc: '2.0', id, method, params });
+    const frame = `Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`;
+    this.proc.stdin!.write(frame);
+
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`LSP timeout: ${method}`));
+      }, RESPONSE_TIMEOUT_MS);
+
+      this.pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v as T); },
+        reject:  (e) => { clearTimeout(timer); reject(e); },
+      });
+    });
+  }
+
+  private notify(method: string, params: unknown): void {
+    const msg = JSON.stringify({ jsonrpc: '2.0', method, params });
+    this.proc.stdin!.write(`Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`);
+  }
+
+  async initialize(rootUri: string): Promise<void> {
+    const result = await this.request<{ capabilities: LspCapabilities }>('initialize', {
+      rootUri,
+      capabilities: {
+        textDocument: {
+          hover:            { contentFormat: ['markdown', 'plaintext'] },
+          publishDiagnostics: { relatedInformation: true },
+          definition:       { linkSupport: false },
+          documentSymbol:   { hierarchicalDocumentSymbolSupport: true },
+          formatting:       {},
+        },
+        workspace: { symbol: {} },
+      },
+      clientInfo: { name: 'agent-lsp-client', version: '1.0' },
+    });
+    this.caps = result.capabilities;
+    this.notify('initialized', {});
+  }
+
+  async openFile(filePath: string): Promise<void> {
+    const { size } = await import('fs/promises').then(fs => fs.stat(filePath));
+    if (size > MAX_FILE_BYTES) throw new Error(`File too large for LSP: ${filePath}`);
+
+    const uri = `file://${filePath}`;
+    if (this.openFiles.has(uri)) return;
+
+    const text = await import('fs/promises').then(fs => fs.readFile(filePath, 'utf-8'));
+    const ext = filePath.slice(filePath.lastIndexOf('.'));
+    this.notify('textDocument/didOpen', {
+      textDocument: { uri, languageId: languageId(ext), version: 1, text },
+    });
+    this.openFiles.add(uri);
+    await new Promise(r => setTimeout(r, 100));  // let server index
+  }
+
+  getDiagnostics(filePath: string): LspDiagnostic[] {
+    return this.diagnostics.get(`file://${filePath}`) ?? [];
+  }
+
+  async shutdown(): Promise<void> {
+    try { await this.request('shutdown', null); } catch {}
+    this.notify('exit', null);
+    this.proc.kill();
   }
 }
 ```
 
-### 25.6 Lazy Initialization
+### 25.5 Connection Manager (Lazy Init + Reconnect)
 
-Start language servers on first use, not at session start. Map `file_extension → server_id`
-and initialize the server the first time a file with that extension is queried:
+```typescript
+interface LspServerConfig {
+  command: string[];
+  extensions: string[];
+  rootPatterns: string[];   // detect project root by walking up for these files
+}
 
-```python
-class LspManager:
-    def __init__(self, configs: dict):
-        self._configs = configs       # extension → config
-        self._clients: dict[str, LspClient] = {}
+const SERVER_CONFIGS: Record<string, LspServerConfig> = {
+  python:     { command: ['pyright-langserver', '--stdio'],            extensions: ['.py', '.pyi'],               rootPatterns: ['pyproject.toml', 'setup.py', 'requirements.txt'] },
+  typescript: { command: ['typescript-language-server', '--stdio'],    extensions: ['.ts', '.tsx', '.js', '.jsx'], rootPatterns: ['tsconfig.json', 'package.json'] },
+  rust:       { command: ['rust-analyzer'],                            extensions: ['.rs'],                        rootPatterns: ['Cargo.toml'] },
+  go:         { command: ['gopls'],                                    extensions: ['.go'],                        rootPatterns: ['go.mod'] },
+  cpp:        { command: ['clangd', '--background-index'],             extensions: ['.cpp', '.c', '.h', '.hpp'],  rootPatterns: ['compile_commands.json', 'CMakeLists.txt'] },
+  java:       { command: ['jdtls'],                                    extensions: ['.java'],                     rootPatterns: ['pom.xml', 'build.gradle'] },
+  zig:        { command: ['zls'],                                      extensions: ['.zig'],                      rootPatterns: ['build.zig'] },
+};
 
-    def get_client(self, file_path: str) -> LspClient | None:
-        ext = Path(file_path).suffix
-        cfg = self._configs.get(ext)
-        if not cfg:
-            return None
-        if ext not in self._clients:
-            client = LspClient(cfg["command"].split() + cfg.get("args", []))
-            client.initialize(f"file://{Path(file_path).parent}")
-            self._clients[ext] = client
-        return self._clients[ext]
+class LspConnectionManager {
+  private clients = new Map<string, LspClient>();
+  private starting = new Map<string, Promise<LspClient>>();
+
+  // Extension → language key
+  private extMap = new Map<string, string>(
+    Object.entries(SERVER_CONFIGS).flatMap(([lang, cfg]) =>
+      cfg.extensions.map(ext => [ext, lang])
+    )
+  );
+
+  async getClient(filePath: string): Promise<LspClient | null> {
+    const ext  = filePath.slice(filePath.lastIndexOf('.'));
+    const lang = this.extMap.get(ext);
+    if (!lang) return null;
+
+    if (this.clients.has(lang)) return this.clients.get(lang)!;
+    if (this.starting.has(lang)) return this.starting.get(lang)!;
+
+    const p = this.startClient(lang, filePath);
+    this.starting.set(lang, p);
+    try {
+      const client = await p;
+      this.clients.set(lang, client);
+      return client;
+    } finally {
+      this.starting.delete(lang);
+    }
+  }
+
+  private async startClient(lang: string, filePath: string): Promise<LspClient> {
+    const cfg = SERVER_CONFIGS[lang];
+    const rootUri = `file://${this.findRoot(filePath, cfg.rootPatterns)}`;
+    const client = new LspClient(cfg.command);
+    await client.initialize(rootUri);
+    return client;
+  }
+
+  private findRoot(filePath: string, patterns: string[]): string {
+    const { existsSync } = require('fs');
+    const { dirname, join } = require('path');
+    let dir = dirname(filePath);
+    while (dir !== dirname(dir)) {
+      if (patterns.some(p => existsSync(join(dir, p)))) return dir;
+      dir = dirname(dir);
+    }
+    return dirname(filePath);  // fallback: file's directory
+  }
+
+  // Reconnect with exponential backoff after server crash
+  async reconnect(lang: string, filePath: string): Promise<LspClient | null> {
+    this.clients.delete(lang);
+    const BACKOFF = [1000, 2000, 4000, 8000];
+    for (const delay of BACKOFF) {
+      await new Promise(r => setTimeout(r, delay));
+      try {
+        return await this.getClient(filePath);
+      } catch {}
+    }
+    return null;
+  }
+
+  async shutdownAll(): Promise<void> {
+    await Promise.allSettled([...this.clients.values()].map(c => c.shutdown()));
+    this.clients.clear();
+  }
+}
+```
+
+### 25.6 LSP Agent Tool
+
+```typescript
+export const lspTool = defineTool({
+  name: 'lsp',
+  description: 'Code intelligence via LSP: definitions, references, diagnostics, hover, symbols, formatting',
+  inputSchema: z.discriminatedUnion('operation', [
+    z.object({ operation: z.literal('definition'),        file: z.string(), line: z.number(), character: z.number() }),
+    z.object({ operation: z.literal('references'),        file: z.string(), line: z.number(), character: z.number() }),
+    z.object({ operation: z.literal('hover'),             file: z.string(), line: z.number(), character: z.number() }),
+    z.object({ operation: z.literal('document_symbols'),  file: z.string() }),
+    z.object({ operation: z.literal('workspace_symbols'), query: z.string() }),
+    z.object({ operation: z.literal('diagnostics'),       file: z.string() }),
+    z.object({ operation: z.literal('format'),            file: z.string() }),
+  ]),
+  execute: async (input, ctx) => {
+    const client = await ctx.lspManager.getClient(input.file ?? '');
+    if (!client) return toolResult(`No LSP server configured for this file type`);
+
+    try {
+      switch (input.operation) {
+        case 'definition': {
+          const locs = await client.definition(input.file, input.line, input.character);
+          return toolResult(formatLocations(locs));
+        }
+        case 'hover': {
+          const text = await client.hover(input.file, input.line, input.character);
+          return toolResult(text || 'No hover info');
+        }
+        case 'diagnostics': {
+          const diags = client.getDiagnostics(input.file);
+          return toolResult(formatDiagnostics(diags, input.file));
+        }
+        // … other operations
+      }
+    } catch (e) {
+      // Server crash → attempt reconnect
+      const ext = input.file.slice(input.file.lastIndexOf('.'));
+      const lang = ctx.lspManager.extMap.get(ext);
+      if (lang) await ctx.lspManager.reconnect(lang, input.file);
+      return toolResult(`LSP error: ${(e as Error).message}`);
+    }
+  },
+});
 ```
 
 ### 25.7 Diagnostics Injection
 
-When a file is opened or modified, passively receive `publishDiagnostics` from the
-language server and cache them. Inject into tool results or system prompt:
+Format diagnostics for the LLM context and auto-inject after file edits:
 
-```python
-def format_diagnostics_for_context(diagnostics: list[dict], file_path: str) -> str:
-    if not diagnostics:
-        return ""
-    lines = [f"LSP diagnostics for {file_path}:"]
-    for d in diagnostics:
-        sev = {1: "ERROR", 2: "WARNING", 3: "INFO", 4: "HINT"}.get(d.get("severity", 1), "?")
-        r = d["range"]["start"]
-        lines.append(f"  [{sev}] line {r['line']+1}:{r['character']+1} — {d['message']}")
-    return "\n".join(lines)
+```typescript
+function formatDiagnostics(diags: LspDiagnostic[], filePath: string): string {
+  if (diags.length === 0) return `No diagnostics for ${filePath}`;
+  const SEV = { 1: 'ERROR', 2: 'WARN', 3: 'INFO', 4: 'HINT' };
+  const lines = diags.map(d => {
+    const sev = SEV[d.severity as 1 | 2 | 3 | 4] ?? '?';
+    const { line, character } = d.range.start;
+    return `  [${sev}] ${line + 1}:${character + 1}  ${d.message}` +
+           (d.relatedInformation?.length ? ` (see ${d.relatedInformation[0].location.uri})` : '');
+  });
+  return `LSP diagnostics — ${filePath}:\n${lines.join('\n')}`;
+}
+
+// Auto-inject diagnostics into the tool result after a file write
+async function postWriteHook(filePath: string, ctx: AgentContext): Promise<string> {
+  const client = await ctx.lspManager.getClient(filePath);
+  if (!client) return '';
+  // Re-sync with updated content
+  const text = await fs.readFile(filePath, 'utf-8');
+  await client.syncFile(filePath, text, Date.now());
+  await new Promise(r => setTimeout(r, 300));  // let server reanalyze
+  const diags = client.getDiagnostics(filePath).filter(d => d.severity === 1);
+  if (diags.length === 0) return '';
+  return '\n\n' + formatDiagnostics(diags, filePath);
+}
 ```
 
 ### 25.8 DAP (Debug Adapter Protocol)
 
-**Not implemented in any agent studied.** DAP requires interactive debugger sessions
-(REPL-style step/continue/inspect), which conflicts with the agent's asynchronous tool
-execution model. Recommended approach if needed: expose DAP as a shell tool
-(`bash: "python -m debugpy --listen 5678 script.py"`) and let the model interact via
-separate `debugpy` client calls rather than implementing a full DAP client.
+→ See [`05-dap-debug-integration.md`](05-dap-debug-integration.md) for a full DAP client
+implementation. DAP uses **identical** Content-Length framing as LSP and exposes as a
+single `debug` tool — the same pattern as the `lsp` tool above.
 
 ---
 

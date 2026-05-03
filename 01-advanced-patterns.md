@@ -310,6 +310,286 @@ Continue from where it left off without re-summarizing."
 
 ---
 
+## §20 — QueryGuard: Concurrent Query Prevention
+
+Prevent re-entrant LLM calls with a synchronous state machine. The generation counter
+ensures stale `finally` blocks (from aborted queries) never overwrite fresh state.
+
+```typescript
+type QueryState = 'idle' | 'dispatching' | 'running';
+
+class QueryGuard {
+  private state: QueryState = 'idle';
+  private generation = 0;
+  private listeners = new Set<() => void>();
+
+  canStart(): boolean { return this.state === 'idle'; }
+
+  start(): number {
+    if (this.state !== 'idle') throw new Error('Query already in progress');
+    this.state = 'dispatching';
+    this.generation++;
+    this.notify();
+    return this.generation;
+  }
+
+  markRunning(gen: number): void {
+    if (gen !== this.generation) return;  // stale — ignore
+    this.state = 'running';
+    this.notify();
+  }
+
+  end(gen: number): void {
+    if (gen !== this.generation) return;  // stale — ignore (prevents double-idle)
+    this.state = 'idle';
+    this.notify();
+  }
+
+  // Forcibly end + increment generation (invalidates all in-flight finally blocks)
+  forceEnd(): void {
+    this.generation++;
+    this.state = 'idle';
+    this.notify();
+  }
+
+  // React useSyncExternalStore compatibility
+  subscribe(fn: () => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+  getSnapshot(): QueryState { return this.state; }
+
+  private notify(): void { for (const fn of this.listeners) fn(); }
+}
+
+// Usage in agent loop
+async function runQuery(query: string, guard: QueryGuard): Promise<void> {
+  if (!guard.canStart()) return;  // drop concurrent request
+  const gen = guard.start();
+  try {
+    guard.markRunning(gen);
+    await executeQuery(query);
+  } finally {
+    guard.end(gen);  // no-op if gen is stale (forceEnd was called)
+  }
+}
+```
+
+---
+
+## §21 — Token Budget Parsing & Context Window Estimation
+
+### User-Specified Budget Formats
+
+Agents accept token budgets in natural language. Parse these with anchored regex to avoid
+false positives in prose.
+
+```typescript
+// Supported formats: "+500k", "2M tokens", "spend 1M tokens", "1000000"
+function parseTokenBudget(input: string): number | null {
+  const patterns: Array<[RegExp, (m: RegExpMatchArray) => number]> = [
+    [/^\+?(\d+(?:\.\d+)?)\s*[Kk]$/,  m => Math.round(parseFloat(m[1]) * 1_000)],
+    [/^\+?(\d+(?:\.\d+)?)\s*[Mm]$/,  m => Math.round(parseFloat(m[1]) * 1_000_000)],
+    [/^spend\s+(\d+(?:\.\d+)?)\s*[Mm]\s+tokens$/i, m => Math.round(parseFloat(m[1]) * 1_000_000)],
+    [/^(\d+)$/,                        m => parseInt(m[1])],
+  ];
+
+  const trimmed = input.trim();
+  for (const [pattern, convert] of patterns) {
+    const match = trimmed.match(pattern);
+    if (match) return convert(match);
+  }
+  return null;
+}
+```
+
+### Accurate Context Window Estimation
+
+The naive approach (sum all messages) is wrong when tool calls are parallel: the model emits
+one assistant message split across multiple `tool_use` blocks, each followed by a `tool_result`.
+Walk back to the first sibling of the split to count accurately.
+
+```typescript
+function estimateContextTokens(
+  messages: Message[],
+  lastApiUsage: Usage | null,
+): number {
+  if (!lastApiUsage) {
+    // Pre-first-response: rough word-count estimate
+    return messages.reduce((sum, m) => sum + roughTokenEstimate(m.content), 0);
+  }
+
+  // Find split point: last assistant message that has siblings in the same turn
+  const splitIdx = findTurnSplitIndex(messages);
+
+  // Messages after split: estimate
+  const newTokens = messages
+    .slice(splitIdx)
+    .reduce((sum, m) => sum + roughTokenEstimate(m.content), 0);
+
+  // Messages before split: use last API response's reported usage
+  // Exclude cache tokens — server-side budget countdown doesn't include them
+  const reportedTokens = lastApiUsage.input_tokens - (lastApiUsage.cache_read_input_tokens ?? 0);
+
+  return reportedTokens + newTokens;
+}
+
+function roughTokenEstimate(content: MessageContent): number {
+  if (typeof content === 'string') return Math.ceil(content.length / 4);
+  if (Array.isArray(content)) return content.reduce((sum, b) => sum + roughBlockTokens(b), 0);
+  return 0;
+}
+```
+
+---
+
+## §22 — Read-Only Command Validation
+
+Before executing a shell command in plan mode or restricted contexts, validate it against
+allowlists. This is deeper than regex — it parses flags and detects exfiltration vectors.
+
+```typescript
+// Per-command safe flag allowlists
+const GIT_READ_ONLY: Record<string, string[]> = {
+  'log':   ['--oneline', '--graph', '--decorate', '--all', '--stat', '-n', '--follow', '--format'],
+  'diff':  ['--stat', '--name-only', '--name-status', '--cached', 'HEAD'],
+  'show':  ['--stat', '--name-only', '--format'],
+  'status': ['-s', '--short', '--branch', '--porcelain'],
+  'ls-files': ['--cached', '--others', '--exclude-standard', '-m'],
+};
+
+const GH_READ_ONLY: Record<string, string[]> = {
+  'pr':    ['list', 'view', 'status', 'checks', 'diff'],
+  'issue': ['list', 'view', 'status'],
+  'repo':  ['view', 'list'],
+};
+
+function isReadOnlyCommand(cmd: string): boolean {
+  const tokens = parseShellTokens(cmd);
+  if (tokens.length === 0) return false;
+
+  const [executable, ...rest] = tokens;
+
+  if (executable === 'git') return isReadOnlyGitCommand(rest);
+  if (executable === 'gh')  return isReadOnlyGhCommand(rest);
+
+  const SAFE_EXECUTABLES = new Set(['cat', 'head', 'tail', 'grep', 'find', 'ls',
+    'pwd', 'echo', 'wc', 'sort', 'uniq', 'diff', 'rg', 'fd']);
+  return SAFE_EXECUTABLES.has(executable);
+}
+
+// Detect credential-leaking git patterns
+function isReadOnlyGitCommand(args: string[]): boolean {
+  const subcmd = args[0];
+  if (!GIT_READ_ONLY[subcmd]) return false;
+
+  // Block --server-option (git ls-remote exfil vector)
+  if (args.some(a => a.startsWith('--server-option'))) return false;
+
+  // Block -S/-G/-O flags that accept arbitrary string args
+  if (args.some(a => /^-[SGO]/.test(a) && a.length === 2)) {
+    // These consume the next token as a pattern — could be used to filter then exfil
+    return false;
+  }
+
+  return args.every(a => isAllowedFlag(a, GIT_READ_ONLY[subcmd]));
+}
+
+// Detect UNC path exfiltration (Windows credential leakage via NTLM)
+function hasUNCPath(cmd: string): boolean {
+  return /(?:\\\\|\/\/)(?:[a-zA-Z0-9._-]+)(?:\\|\/)/.test(cmd)
+    || /@SSL@|DavWWWRoot/i.test(cmd);
+}
+
+// Detect gh repo exfiltration via HOST/OWNER/REPO pattern
+function isGhRepoExfil(value: string): boolean {
+  if (value.includes('://') || value.includes('@')) return true;
+  return value.split('/').length > 2;  // HOST/OWNER/REPO has 2+ slashes
+}
+```
+
+---
+
+## §23 — Session Storage: Atomic JSONL with Per-File Queues
+
+Transcript writes must be atomic, ordered, and resilient to concurrent writes from
+swarm teammates writing to the same session log.
+
+```typescript
+class SessionStorage {
+  // Per-file write queues — prevents interleaving on concurrent writes
+  private writeQueues = new Map<string, WriteQueue>();
+
+  private getQueue(filePath: string): WriteQueue {
+    if (!this.writeQueues.has(filePath)) {
+      this.writeQueues.set(filePath, new WriteQueue(filePath));
+    }
+    return this.writeQueues.get(filePath)!;
+  }
+
+  async append(filePath: string, entry: SessionEntry): Promise<void> {
+    const queue = this.getQueue(filePath);
+    return queue.append(entry);
+  }
+}
+
+class WriteQueue {
+  private pending: Array<{ entry: SessionEntry; resolve: () => void }> = [];
+  private drainTimer: ReturnType<typeof setTimeout> | null = null;
+  private draining = false;
+
+  constructor(private filePath: string) {}
+
+  append(entry: SessionEntry): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.pending.push({ entry, resolve });
+      if (!this.drainTimer) {
+        // Batch writes every 100ms for efficiency
+        this.drainTimer = setTimeout(() => this.drain(), 100);
+      }
+    });
+  }
+
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    this.drainTimer = null;
+
+    const batch = this.pending.splice(0);
+    if (batch.length === 0) { this.draining = false; return; }
+
+    const lines = batch.map(({ entry }) => JSON.stringify(entry) + '\n').join('');
+    // Atomic: O_APPEND guarantees no interleaving even with concurrent writers
+    await fs.appendFile(this.filePath, lines, { flag: 'a', mode: 0o600 });
+
+    for (const { resolve } of batch) resolve();
+    this.draining = false;
+  }
+}
+
+// Tail-read metadata (64KB) instead of loading the full transcript
+async function readLiteMetadata(filePath: string): Promise<SessionMetadata | null> {
+  const stat = await fs.stat(filePath).catch(() => null);
+  if (!stat) return null;
+
+  const TAIL_SIZE = 64 * 1024;
+  const offset = Math.max(0, stat.size - TAIL_SIZE);
+  const buffer = Buffer.alloc(Math.min(TAIL_SIZE, stat.size));
+  const fd = await fs.open(filePath, 'r');
+  await fd.read(buffer, 0, buffer.length, offset);
+  await fd.close();
+
+  // Parse JSONL lines from tail, extract metadata entries (last-wins)
+  const metadata: Partial<SessionMetadata> = {};
+  for (const line of buffer.toString('utf-8').split('\n')) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.type === 'metadata') Object.assign(metadata, entry.data);
+    } catch {}
+  }
+  return metadata as SessionMetadata;
+}
+```
 
 ---
 
