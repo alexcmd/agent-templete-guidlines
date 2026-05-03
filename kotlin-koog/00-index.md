@@ -22,6 +22,7 @@
 | 09 | [session-persistence.md](./09-session-persistence.md) | Koog Persistence, RollbackRegistry, compaction, resume |
 | 10 | [prompts.md](./10-prompts.md) | SystemPromptBuilder, ReAct templates, HyDE, KG extraction |
 | 11 | [complete-example.md](./11-complete-example.md) | Full software-dev agent, Docker Compose, observability |
+| 12 | [testing.md](./12-testing.md) | Unit tests (Kotest), integration (real API, @Tag), eval harness (BenchmarkRunner, Scorers), Gradle config |
 
 ---
 

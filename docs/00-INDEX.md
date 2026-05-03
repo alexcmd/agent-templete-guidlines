@@ -22,6 +22,12 @@ This documentation set reverse-engineers Claude Code from source to give you eve
 | 14 | [Reproduction Blueprint](./14-reproduction-blueprint.md) | Step-by-step guide to build a domain-specific agent |
 | 15 | [Diagrams](./15-diagrams.md) | ASCII architecture, sequence, and component diagrams |
 | 16 | [Complete Prompt Documentation](./16-prompts-complete.md) | Every prompt in Claude Code — system prompt sections, all 27 tool descriptions, 5 built-in agent system prompts, compaction/coordinator/proactive prompts, service prompts (SessionMemory, MagicDocs, ExtractMemories), buddy prompt, cache strategy, and dynamic combination matrix |
+| 17 | [Speculative Execution](./17-speculative-execution.md) | SpeculationState machine, mutable-ref streaming optimization, prompt suggestion, CompletionBoundary, timeSavedMs, reproduction in Python |
+| 18 | [Compaction Deep Dive](./18-compaction-deep-dive.md) | Threshold arithmetic, cached microcompact (cache_edits API), time-based microcompact, session memory compaction, full autocompact, circuit breaker |
+| 19 | [Abort Signal Cascade](./19-abort-cascade.md) | Three-level AbortController hierarchy, sibling-abort (Bash-only), permission rejection bubble-up, tool interruptBehavior, synthetic error messages |
+| 20 | [Session Memory Extraction](./20-session-memory-extraction.md) | Background forked subagent extraction, token+tool-call thresholds, sequential wrapper, file isolation (0o600/0o700), manual /summary command |
+| 21 | [Prompt Caching Deep Dive](./21-prompt-caching.md) | 4-slot budget, system prompt splitting (3 modes: global/tool-based/default), single message-level marker, scope/TTL decision (org 5m/1h, global 24h), usage tracking (cache_creation/cache_read/ephemeral_1h/5m), 2-phase break detection, cache_edits microcompact |
+| 22 | [Bridge Protocol](./22-bridge-protocol.md) | Connecting external apps to Claude Code — OAuth registration, long-poll work queue, WorkSecret decode, v1 WebSocket vs v2 SSE transports, all 20 control request subtypes, token refresh, Python client + workflow examples |
 
 ## Quick Summary
 

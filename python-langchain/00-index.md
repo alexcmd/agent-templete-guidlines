@@ -23,6 +23,7 @@ LangSmith with full type hints and async support.
 | 10 | [10-prompts.md](10-prompts.md) | Templates, ReAct/Reflexion/HyDE prompts, Hub versioning |
 | 11 | [11-complete-example.md](11-complete-example.md) | Full research + code-gen agent, Docker Compose |
 | 12 | [12-langsmith-observability.md](12-langsmith-observability.md) | Tracing, evaluation, datasets, LLM-as-judge |
+| 13 | [13-testing.md](13-testing.md) | Unit tests (tool schema, handler, state machine), integration (real API), eval harness (LLM-as-judge), CI config |
 
 ---
 

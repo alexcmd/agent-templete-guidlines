@@ -33,6 +33,10 @@ Claude Code has five distinct extension mechanisms. Each solves a different prob
 - [08-mcp-registration-deep.md](08-mcp-registration-deep.md) — All 7 registration paths, full config type reference, plugin formats (4 kinds), enterprise allowlist/denylist, `.mcp.json` traversal, agent MCP declaration, CLI `mcp add` commands
 - [09-mcp-workflow-internals.md](09-mcp-workflow-internals.md) — Full connection lifecycle, tool wrapping pipeline, tool call execution, OAuth flow, MCPB/DXT bundle workflow, elicitation protocol, content size management
 
+### Bridge & Remote Integration
+- [10-bridge-protocol.md](10-bridge-protocol.md) — REPL↔Web bridge: ReplBridgeHandle, command/skill filtering (BRIDGE_SAFE_COMMANDS, isBridgeSafeCommand), full SDKMessage union (25+ types), all 21 SDKControlRequest subtypes, initialize handshake (inject agents/hooks/MCP), HybridTransport batching, CapacityWake, trusted device token
+- [11-remote-client-integration.md](11-remote-client-integration.md) — Third-party apps as remote clients: two connection modes (env-based vs env-less/CCR v2), full API endpoint reference, WorkSecret schema, RemoteCredentials, permission handling, viewer mode WebSocket, complete Python implementation
+
 ---
 
 ## Quick Start by Use Case
@@ -63,6 +67,12 @@ Claude Code has five distinct extension mechanisms. Each solves a different prob
 
 **"I want to understand how MCP connections, tool calls, and OAuth work internally"**  
 → Read [09-mcp-workflow-internals.md](09-mcp-workflow-internals.md)
+
+**"I want to connect my app to Claude Code as a remote client"**  
+→ Read [11-remote-client-integration.md](11-remote-client-integration.md)
+
+**"I want to understand how the bridge filters commands and what message types flow over it"**  
+→ Read [10-bridge-protocol.md](10-bridge-protocol.md)
 
 ---
 
@@ -109,6 +119,14 @@ Key source files for extension development:
 | `src/types/hooks.ts` | Hook output types, HookResult, per-event hookSpecificOutput |
 | `src/plugins/builtinPlugins.ts` | Built-in plugin registry |
 | `src/entrypoints/sdk/coreTypes.ts` | HOOK_EVENTS array (all 27 events) |
-| `src/commands.ts` | Command type definitions, getCommands() |
+| `src/commands.ts` | Command type definitions, `BRIDGE_SAFE_COMMANDS`, `isBridgeSafeCommand`, `getCommands()` |
 | `src/Tool.ts` | Tool interface (for MCP tool wrapping) |
 | `src/services/mcp/types.ts` | McpServerConfig schemas |
+| `src/bridge/replBridge.ts` | `ReplBridgeHandle`, `BridgeCoreParams`, `BridgeState` |
+| `src/bridge/bridgeApi.ts` | `BridgeApiClient` — all HTTP endpoints and auth patterns |
+| `src/bridge/codeSessionApi.ts` | Env-less session creation (`/v1/code/sessions`) |
+| `src/bridge/workSecret.ts` | WorkSecret decode, SDK URL construction |
+| `src/bridge/trustedDevice.ts` | Trusted device token (keychain + enrollment) |
+| `src/entrypoints/sdk/controlSchemas.ts` | All 21 SDKControlRequest Zod schemas |
+| `src/entrypoints/sdk/coreSchemas.ts` | SDKMessage union (25+ types), initialize response |
+| `src/remote/RemoteSessionManager.ts` | Viewer mode WebSocket subscriber |

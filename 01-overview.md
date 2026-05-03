@@ -25,6 +25,8 @@
 | [01-extensions-sdk-mcp.md](01-extensions-sdk-mcp.md) | §25–28 | LSP client, plugin system, SDK API, MCP (6 transports, OAuth) |
 | [05-dap-debug-integration.md](05-dap-debug-integration.md) | §1–7 | DAP client, adapter lifecycle, breakpoints, stepping, variable inspection, agent loop, Claude Code source architecture map |
 | [05-dap-claude-code-plugin.md](05-dap-claude-code-plugin.md) | §1–10 | External debugger plugin (zero source changes): MCP server, hooks, skills, full worked example, limitations, decision matrix |
+| [01-token-budget-management.md](01-token-budget-management.md) | §22 | Canonical token counter, threshold arithmetic (effective window, autocompact, blocking), output capping, budget across compaction, circuit breaker |
+| [claude-code-extensions/10-bridge-protocol.md](claude-code-extensions/10-bridge-protocol.md) | — | REPL↔Web bidirectional bridge: ReplBridgeHandle, V1 polling / V2 WebSocket transports, FlushGate ordering, SDKControlRequest/Response, outbound-only mode |
 
 ---
 
@@ -82,6 +84,9 @@ User Input
 
 **"I need production-ready implementations"**
 → [03-production-agents.md](03-production-agents.md) → [03-utilities-mcp-checklist.md](03-utilities-mcp-checklist.md)
+
+**"I want to minimize API cost with prompt caching"**
+→ [docs/21-prompt-caching.md](docs/21-prompt-caching.md)
 
 **"I want to add IDE/LSP/plugin support"**
 → [01-extensions-sdk-mcp.md](01-extensions-sdk-mcp.md)

@@ -21,6 +21,7 @@
 | [09-session-persistence.md](09-session-persistence.md) | Sessions & Persistence | JSONL serialization, compaction, SQLite, config loading |
 | [10-prompts.md](10-prompts.md) | Prompt Engineering | SystemPromptBuilder, ReAct templates, HyDE, KG extraction, caching |
 | [11-complete-example.md](11-complete-example.md) | Full Working Example | main.cpp, CMakeLists.txt, all subsystems wired, build instructions |
+| [12-testing.md](12-testing.md) | Testing | GoogleTest unit tests, GMock tool handlers, integration tests (ANTHROPIC_API_KEY gate), eval benchmark (ContainsAll/ToolUsed scorers), CMake config |
 
 ---
 
