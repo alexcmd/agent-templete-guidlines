@@ -24,11 +24,13 @@ The mechanisms fall into eight categories:
 Category 1 — Process-level sync block       (execSync: halts Node.js event loop)
 Category 2 — Tool permission / approval gate (shouldDefer + 'ask': halts REPL)
 Category 3 — Hook execution blocking         (sync hook subprocess waits)
+  ↳ asyncRewake variant: background hook, exit 2 → system-reminder notification wakes model
 Category 4 — Polling loops                   (poll until condition, with sleep)
 Category 5 — Filesystem-driven wakeup        (chokidar / fs.watch + hook fire)
 Category 6 — Network waiting                 (SSE, WebSocket, HTTP await)
 Category 7 — Promise-based coordination      (stored resolve, AbortController)
 Category 8 — Keyboard-driven wakeup          (key handler → editor or dialog)
+Category 9 — Monitor tool                    (each stdout line wakes model; no stall watchdog)
 ```
 
 External code accessibility matrix (columns = who can use it):
@@ -38,11 +40,13 @@ External code accessibility matrix (columns = who can use it):
 | 1 Process sync | via Bash tool | ✓ direct | ✗ | ✗ | via Bash tool |
 | 2 Tool approval | call the tool | trigger via PreToolUse | trigger via PreToolUse | register tool | call the tool |
 | 3 Hook blocking | via skill hooks field | ✓ direct | ✓ callback | register hook | ✗ |
+| 3 asyncRewake | ✗ | ✓ asyncRewake:true | ✗ | register hook | ✗ |
 | 4 Polling | ✗ internal | async flag | ✗ | ✗ | ✗ |
 | 5 Filesystem | configure FileChanged | ✓ via exit watchPaths | ✓ | ✓ configure | ✗ |
 | 6 Network | RemoteTrigger tool | ✗ | ✗ | ✗ | RemoteTrigger tool |
 | 7 Promise coord | ✗ | ✗ | ✗ | ✗ | ✗ |
 | 8 Keyboard | configure keybindings | ✗ | ✗ | configure keybindings | ✗ |
+| 9 Monitor | ✗ | ✗ | ✗ | ✗ | via Monitor tool call |
 
 ---
 
@@ -226,13 +230,13 @@ Exit code semantics:
 - `2` — deny (requires `"blocking": true`)
 - other non-zero — warning only, tool allowed
 
-**Async hooks** (`"async": true` in initial stdout JSON):
+**Async hooks — two distinct modes:**
 
-The hook outputs `{"async": true, "asyncTimeout": 30000}` first, then
-continues running in the background. The REPL polls
-`AsyncHookRegistry.checkForAsyncHookResponses()` each main-loop tick. When
-the hook eventually exits and prints its final JSON response, the REPL
-processes it.
+**Mode A — Self-declaring async** (hook outputs `{"async": true}` to stdout first):
+
+The hook starts synchronously, writes the JSON header to declare it needs more time,
+then continues running. The REPL registers it in `AsyncHookRegistry` and polls each
+main-loop tick:
 
 ```
 Hook subprocess starts → prints {"async": true} → registered in pendingHooks
@@ -242,13 +246,50 @@ checkForAsyncHookResponses() polls:
   - hook.shellCommand.status === 'completed'? → parse final stdout JSON
   - timeout exceeded? → kill hook, inject timeout error
 When final response arrives:
-  if asyncRewake=true && exitCode=2: re-enter permission flow
   if exitCode=0: mark success, inject stdout as system message
+  if exitCode≠0: inject stderr as error system message
 ```
 
-**`asyncRewake: true`** — the async hook can re-trigger a permission dialog
-after running in the background. Use case: open VSCode in background, user
-reviews, hook exits 2 when user requests changes → permission dialog re-opens.
+**Mode B — `asyncRewake: true` in settings.json (bypass path)**:
+
+asyncRewake hooks are a completely distinct execution path — they **bypass
+`AsyncHookRegistry` entirely**. The hook does NOT write `{"async": true}` to
+stdout. Instead, stdin is injected with the JSON payload before the process
+is backgrounded (`utils/hooks.ts:1006`), and the hook's result is handled
+by a direct `.then()` callback:
+
+```
+Hook subprocess starts → JSON payload written to stdin → process backgrounded
+Agent loop continues (no registry polling)
+  ...hook runs independently...
+On hook exit (utils/hooks.ts:218-243):
+  setImmediate() — flush pending stdio events into in-memory TaskOutput
+  read stdout + stderr
+  emitHookResponse(exitCode, stdout, stderr)
+  if exitCode === 2:
+    enqueuePendingNotification({
+      value: wrapInSystemReminder(
+        `Stop hook blocking error from command "${hookName}": ${stderr || stdout}`
+      ),
+      mode: 'task-notification'
+    })
+    → model wakes via useQueueProcessor (idle)
+      OR queued_command attachments (busy mid-query)
+  if exitCode === 0: success, no model wakeup
+```
+
+**Critical distinction:** exit code 2 on an asyncRewake hook does NOT re-enter
+a permission dialog. It enqueues a **system reminder** that wakes the model. The
+model receives the message content (stderr/stdout) and can react (retry, report
+to user, etc.) — but no dialog is shown and no permission gate is re-evaluated.
+
+**Implementation constraints** (`utils/hooks.ts:205-246`):
+- Does NOT call `shellCommand.background()` — avoids `spillToDisk()` which
+  would break in-memory stdout/stderr capture
+- StreamWrappers stay attached and pipe data into in-memory TaskOutput buffers
+- `setImmediate()` yields to I/O to flush pending stdio events before reading
+- Survives new user prompts (abort reason `'interrupt'` is a no-op for the hook)
+- Hard Escape cancel WILL kill the hook — desired behavior for user control
 
 **Available hook events:**
 
@@ -685,6 +726,95 @@ restarting Claude Code.
 
 ---
 
+## Category 9 — Monitor Tool (Stream-per-Line Wakeup)
+
+The Monitor tool (`feature('MONITOR_TOOL')`) is a specialized background process
+wrapper where **each stdout line from the monitored process becomes a separate
+notification** that wakes the model. Unlike `run_in_background` (single wakeup
+on completion), Monitor gives the model a continuous stream of events.
+
+### Mechanism
+
+Monitor creates a `LocalShellTask` with `kind: 'monitor'` and streams output
+lines as `task-notification` events (via `enqueueStreamEvent`) with no `<status>`
+tag — these are progress pings, not terminal events. The model is woken on each
+line and can react in real-time.
+
+```
+Monitor("docker events --filter type=container", description="Watch containers")
+  │
+  ├── Spawns process as LocalShellTask with kind='monitor'
+  ├── Each stdout line → enqueueStreamEvent → no <status> tag
+  │       → model wakes (progress ping, NOT task completion)
+  │       → model reads the line and can act
+  │
+  └── On process exit:
+        completed → "Monitor '<description>' stream ended"
+        failed    → "Monitor '<description>' script failed (exit N)"
+        killed    → "Monitor '<description>' stopped"
+```
+
+**Key differences from `Bash(run_in_background=True)`:**
+
+| | `run_in_background` | `Monitor` |
+|---|---|---|
+| Wakeup events | One (on completion) | One per stdout line |
+| Model sees | Final status + output file path | Each line as it arrives |
+| Use case | Wait for process to finish | React to streaming events |
+| Stall watchdog | Yes (detects prompt hang) | No (streaming-only, no stall) |
+| Completion message | "background command completed" | "stream ended / script failed / stopped" |
+| Collapses with others | Yes (N background commands) | No (distinct summary prefix) |
+| Leading sleep ≥ 2s | Blocked by BashTool | Irrelevant (not a shell command) |
+
+### Until-loop pattern
+
+Monitor is the correct tool for condition polling:
+
+```
+Monitor("until condition; do sleep 2; done", description="Wait for service")
+```
+
+The until-loop exits (stream ends) when the condition is met. The model is
+notified "stream ended" and can proceed. Compare to the wrong pattern:
+
+```bash
+# Wrong: sleep loop in Bash blocks and wastes a tool call per iteration
+while ! curl -sf http://service/health; do sleep 2; done  # blocks Claude Code
+
+# Right: use Monitor for the polling, Bash for the action after
+Monitor("until curl -sf http://service/health; do sleep 2; done")
+# model wakes when stream ends → then runs next step
+```
+
+### Use cases
+
+```
+Stream build output line by line         Monitor("npm run build 2>&1")
+Watch docker/k8s events in real-time    Monitor("kubectl get events -w")
+Poll until condition met                 Monitor("until check; do sleep 2; done")
+Tail a log file for errors               Monitor("tail -f /var/log/app.log | grep ERROR")
+Watch filesystem for file appearance     Monitor("inotifywait -m /tmp/output.json")
+```
+
+### Who can use it
+
+**Model (Claude)** — calls the Monitor tool directly when `MONITOR_TOOL` feature
+is enabled. The system prompt explicitly says: _"Use the Monitor tool to stream
+events from a background process (each stdout line is a notification). For
+one-shot 'wait until done,' use Bash with run_in_background instead."_
+
+**Not available to:** hooks, skills, or plugins directly. Hooks can spawn their
+own long-running processes, but those don't feed back into the Monitor stream.
+
+### Implementation notes
+
+- `startStallWatchdog()` skips monitor tasks: `if (kind === 'monitor') return () => {}` (`LocalShellTask.tsx:47`)
+- `collapseBackgroundBashNotifications()` never collapses Monitor events (no `<status>` tag, distinct summary prefix)
+- Status pill counts monitors separately from bash tasks (`pillLabel.ts:19`)
+- UI shows `description` instead of raw command (`BackgroundTasksDialog.tsx:498`)
+
+---
+
 ## Comparative Analysis: Which Mechanism to Use When
 
 ### Choosing the right block type for external review/approval
@@ -699,7 +829,8 @@ Ask user to choose between options    AskUserQuestion tool (via skill prompt)
                                       → structured 2–4 option dialog
 
 Wait for CI test results              FileChanged hook on test-results.json
-                                      OR async hook with asyncRewake on Bash(run tests)
+                                      OR Monitor("until test-results.json exists; do sleep 2; done")
+                                      OR asyncRewake hook on Bash(run tests) → model woken with result
 
 External approval system (Slack, etc) HTTP hook on PreToolUse
                                       → your server waits for Slack reaction, then responds
@@ -713,6 +844,12 @@ Guard a dangerous command             PreToolUse hook (blocking) on Bash
 React to env/config change            FileChanged hook on .env / config files
 
 Remote agent scheduling               RemoteTrigger tool (list/create/run)
+
+React to streaming events in real-time Monitor tool (each stdout line wakes model)
+                                      → docker events, kubectl -w, log tail, etc.
+
+Poll until condition                  Monitor("until <check>; do sleep 2; done")
+                                      → model woken when stream ends (condition met)
 
 Sub-agent waiting for team lead       setAwaitingPlanApproval + mailbox polling
                                       (swarm mode only)
@@ -735,10 +872,15 @@ Sub-agent waiting for team lead       setAwaitingPlanApproval + mailbox polling
    └── halts permission check phase
    └── hook subprocess must exit before tool call proceeds
 
-4. Async hook (async: true, asyncRewake: true)
+4. Async hook (async: true)
    └── agent continues other work
-   └── hook may re-enter permission flow later
+   └── hook polled by AsyncHookRegistry each main-loop tick
    └── weakest: non-deterministic timing
+
+4b. asyncRewake hook
+   └── agent continues other work (bypasses registry)
+   └── exit code 2 → system-reminder notification wakes model
+   └── does NOT re-enter permission dialog — model receives message and decides
 ```
 
 ### Timeout reference
@@ -817,28 +959,39 @@ code --wait "$PLAN" && exit 0 || echo '{"allowed":false,"reason":"Review aborted
 Your server receives the hook payload, can take up to 300s to respond with
 `{"allowed": true/false}`. Use for Slack/email approval flows.
 
-### Pattern C — Async review with re-entry
+### Pattern C — asyncRewake: background hook that wakes the model
 ```json
 {
   "type": "command",
   "command": "~/.agent/hooks/async_review.sh",
-  "blocking": false,
   "asyncRewake": true,
   "timeout": 600
 }
 ```
 ```bash
 #!/usr/bin/env bash
-echo '{"async": true, "asyncTimeout": 600000}'
-INPUT=$(cat /dev/stdin)   # already consumed above — store first
+# asyncRewake hooks: stdin is pre-loaded with JSON before background launch.
+# Do NOT output {"async": true} — asyncRewake bypasses the async registry.
+INPUT=$(cat)
+PLAN_FILE=$(echo "$INPUT" | jq -r '.inputJson.planFilePath // empty')
+[ -z "$PLAN_FILE" ] && exit 0
+
 code --wait "$PLAN_FILE"
+
 # User closed VSCode. Did they approve?
 if grep -q 'APPROVED' "$PLAN_FILE"; then
-  exit 0   # continue
+  exit 0                   # success — model is NOT woken up
 else
-  exit 2   # re-enter permission flow (asyncRewake)
+  # exit 2 → enqueuePendingNotification wrapping stderr/stdout as system reminder
+  # The model wakes and reads this message — no permission dialog is shown.
+  echo "Plan review failed: user did not mark APPROVED in $PLAN_FILE"
+  exit 2
 fi
 ```
+
+**Note:** exit 2 wakes the model with a `<system-reminder>` containing the hook's
+stderr/stdout. This is NOT a permission re-entry — the model receives the message
+and decides how to proceed (retry, ask user, abort, etc.).
 
 ### Pattern D — AskUserQuestion via skill (structured dialog)
 ```typescript

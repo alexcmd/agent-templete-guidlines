@@ -19,8 +19,12 @@
 | [01-clear-context-plan-user-interaction.md](01-clear-context-plan-user-interaction.md) | §1–6 | Clear-context-and-execute pattern (source-verified), AskUserQuestion, all user-interaction tools, hooks full reference, skill implementation guide |
 | [01-sessions-cost-ide.md](01-sessions-cost-ide.md) | §21–23 | Session JSONL, cost tracking, IDE integration (LSP, delta context) |
 | [01-ide-integration.md](01-ide-integration.md) | §1–12 | IDE integration source-verified deep dive: lockfile protocol, MCP sse-ide/ws-ide transports, RPC (openDiff/closeTab), diff viewer hook, WSL path conversion, reproduction guide |
+| [01-jetbrains-ide-plugin.md](01-jetbrains-ide-plugin.md) | §1–9 | JetBrains deep dive: plugin detection (jetbrains.ts), three-tier caching, two-phase terminal detection, all 15 IDE process keywords, notification schemas (ide_connected/selection_changed/log_event), auth token header, status notice logic, plugin-side reproduction guide (Python/Kotlin/C++23) |
+| [01-ide-embedded-terminal.md](01-ide-embedded-terminal.md) | §1–14 | `isSupportedTerminal()` master gate, auto-connect unconditional vs opt-in, /config option switching, dialog suppression, ancestry check disambiguation, IDE name fallback, extension/plugin install flow, JetBrains status notice, /ide message differences, VS Code save-file hint, tmux/FORCE_CODE_TERMINAL/CLAUDE_CODE_AUTO_CONNECT_IDE edge cases, decision matrix, reproduction guide (Python/Kotlin/C++23) |
 | [01-distributed-agents.md](01-distributed-agents.md) | §24 | A2A protocol, Agent Card, distributed task delegation, JWT auth |
 | [01-extensions-sdk-mcp.md](01-extensions-sdk-mcp.md) | §25–28 | LSP client, plugin system, SDK API, MCP (6 transports, OAuth) |
+| [05-dap-debug-integration.md](05-dap-debug-integration.md) | §1–7 | DAP client, adapter lifecycle, breakpoints, stepping, variable inspection, agent loop, Claude Code source architecture map |
+| [05-dap-claude-code-plugin.md](05-dap-claude-code-plugin.md) | §1–10 | External debugger plugin (zero source changes): MCP server, hooks, skills, full worked example, limitations, decision matrix |
 
 ---
 
@@ -81,6 +85,9 @@ User Input
 
 **"I want to add IDE/LSP/plugin support"**
 → [01-extensions-sdk-mcp.md](01-extensions-sdk-mcp.md)
+
+**"I want to add debugger support to my agent"**
+→ [05-dap-debug-integration.md](05-dap-debug-integration.md) → [05-dap-claude-code-plugin.md](05-dap-claude-code-plugin.md)
 
 ---
 

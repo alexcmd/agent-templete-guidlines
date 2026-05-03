@@ -465,34 +465,81 @@ agent actions without changing core agent code.
 **stdin payload (all events):**
 ```json
 {
-  "event": "PreToolUse",
-  "tool": "Bash",
-  "inputJson": {"command": "git status"},
-  "sessionId": "abc-123",
-  "workingDirectory": "/home/user/project"
+  "session_id": "abc-123",
+  "hook_event_name": "PreToolUse",
+  "transcript_path": "/tmp/claude-sessions/abc-123/transcript.jsonl",
+  "cwd": "/home/user/project",
+  "permission_mode": "ask",
+  "tool_name": "Bash",
+  "tool_input": {"command": "git status"},
+  "tool_use_id": "toolu_01abc"
 }
 ```
 
-**stdout response (PreToolUse only — can control execution):**
+**stdout response for PreToolUse (controls execution):**
 ```json
 {
-  "allowed": true,
-  "updatedInput": {"command": "git status --short"},
-  "reason": "Normalized verbose flag"
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "updatedInput": {"command": "git status --short"},
+    "additionalContext": "Normalized verbose flag"
+  }
 }
 ```
 
-| Response field | Effect |
-|---------------|--------|
-| `allowed: false` + `blocking: true` | Deny the tool call; inject `reason` as error |
-| `allowed: false` + `blocking: false` | Warn user but allow (soft block) |
+| hookSpecificOutput field | Effect |
+|--------------------------|--------|
+| `permissionDecision: "deny"` | Block the tool call |
+| `permissionDecision: "allow"` | Explicitly allow |
+| `permissionDecision: "ask"` | Show permission dialog to user |
 | `updatedInput: {...}` | Replace tool input with modified version |
-| `(no stdout)` | Allow unconditionally |
+| `additionalContext: "..."` | Inject text into the model's conversation |
+| `(empty stdout)` | Allow unconditionally |
 
 **Exit code semantics (command type):**
-- `0` — allow
-- `2` — deny (if hook is blocking)
-- Other non-zero — warning only
+
+| Code | Behavior |
+|------|----------|
+| `0` | Success. Stdout consumed as JSON or plain text (injected into model context / transcript). |
+| `1` | Non-blocking error. Execution continues; stderr shown to user. |
+| `2` | **Blocking.** Action blocked; stderr becomes the block reason shown to user. |
+| `>2` | Same as `1` (non-blocking). |
+
+Note: exit 0 with `{"decision":"block"}` in stdout is also treated as a block.
+
+### 20.3.1 Hook Execution Environment
+
+Hooks run in **embedded Node.js subprocesses** (`spawn()`), not in the user's terminal:
+
+| Platform | Shell |
+|----------|-------|
+| Unix/macOS | `/bin/sh` via `spawn(cmd, [], { shell: true })` |
+| Windows | Git Bash (Cygwin) — paths must be POSIX format |
+| `shell: 'powershell'` | `pwsh -NoProfile -NonInteractive -Command <cmd>` |
+
+Subprocess inherits parent `process.env` plus these injected variables:
+
+| Variable | Set When | Description |
+|----------|----------|-------------|
+| `CLAUDE_PROJECT_DIR` | Always | Project root (stable, never worktree path) |
+| `CLAUDE_PLUGIN_ROOT` | Plugin/skill hooks | Plugin or skill install path |
+| `CLAUDE_PLUGIN_DATA` | Plugin hooks | Plugin data directory |
+| `CLAUDE_PLUGIN_OPTION_*` | Plugin hooks | One var per user config option (`apiKey` → `CLAUDE_PLUGIN_OPTION_APIKEY`); see §20.3.2 |
+| `CLAUDE_ENV_FILE` | SessionStart/Setup/CwdChanged/FileChanged (bash only) | `.sh` file hook writes `VAR=value` exports into; injected into subsequent bash commands |
+
+Tool context (tool name, input, output) is **not** in env vars — it comes via stdin JSON.
+
+### 20.3.2 Plugin Option Env Vars (`CLAUDE_PLUGIN_OPTION_*`)
+
+Plugin options are exposed per-key as `CLAUDE_PLUGIN_OPTION_{KEY}` (key uppercased, non-identifier chars → `_`). Storage is split at save time:
+
+- **Non-sensitive** (`sensitive: false` / absent) → `settings.json pluginConfigs[pluginId].options`
+- **Sensitive** (`sensitive: true`) → macOS keychain or `.credentials.json` → `secureStorage.pluginSecrets[pluginId]`
+
+Both are merged at load time (secure storage wins on collision). **Sensitive values are included** in the env vars — hooks run user code and share the same trust boundary as direct keychain access.
+
+Template substitution `${user_config.KEY}` is also performed in the hook command string before spawn (throws on missing key). In skill/agent prose, sensitive keys render as a placeholder to prevent secrets entering the model context.
 
 ### 20.4 Hook Configuration
 
@@ -501,12 +548,12 @@ agent actions without changing core agent code.
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash(rm *)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
             "command": "~/.agent/hooks/confirm_delete.sh",
-            "blocking": true,
+            "if": "Bash(rm *)",
             "timeout": 10
           }
         ]
@@ -518,7 +565,8 @@ agent actions without changing core agent code.
           {
             "type": "http",
             "url": "https://audit.example.com/agent-events",
-            "headers": {"Authorization": "Bearer ${AUDIT_TOKEN}"}
+            "headers": {"Authorization": "Bearer $AUDIT_TOKEN"},
+            "allowedEnvVars": ["AUDIT_TOKEN"]
           }
         ]
       }
@@ -538,25 +586,26 @@ agent actions without changing core agent code.
 }
 ```
 
-**Execution order:** Sequential within a matcher group; first non-allow result wins.
+**Execution order:** Sequential within a matcher group; exit code `2` or `permissionDecision: "deny"` from any hook stops subsequent hooks for that event.
 
-**`matcher` field syntax:** Same glob syntax as permission rules: `ToolName(input glob)`.
-Omit matcher to run on all tool calls of that event type.
+**`matcher` field syntax:** Case-insensitive substring match against the tool name (for tool events). Omit to run on all events of that type. Pipe-separate for OR: `"Write|Edit"`.
+
+**`if` field syntax:** Permission rule syntax evaluated before spawning: `"Bash(rm *)"`, `"Write(src/**)"`
 
 **Special flags:**
 - `once: true` — hook fires once then is removed from the registry
-- `asyncRewake: true` — hook runs in background; if it exits 2, re-enters the permission flow
-- `timeout` — seconds before hook is killed (default varies by type; 10s for command, 60s for agent)
+- `asyncRewake: true` — hook runs in background; exit code `2` wakes the model
+- `async: true` — fire-and-forget; never blocks
+- `timeout` — seconds before hook is killed (default: **600s / 10 min** for all types; **1.5s for SessionEnd/Stop** — override with `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS`)
 
 ### 20.5 Example Hooks
 
 **Audit logger (PostToolUse):**
 ```bash
 #!/bin/bash
-# Append every tool call to an audit log
-INPUT=$(cat)
-TOOL=$(echo "$INPUT" | jq -r '.tool')
-CMD=$(echo "$INPUT" | jq -r '.inputJson.command // "n/a"')
+INPUT=$(cat)   # stdin is the authoritative JSON source
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
+CMD=$(echo "$INPUT" | jq -r '.tool_input.command // "n/a"')
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$TOOL] $CMD" >> ~/.agent/audit.log
 ```
 
@@ -564,10 +613,12 @@ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$TOOL] $CMD" >> ~/.agent/audit.log
 ```bash
 #!/bin/bash
 INPUT=$(cat)
-PATH=$(echo "$INPUT" | jq -r '.inputJson.path')
-if [[ "$PATH" == *.py ]]; then
-  python -m py_compile "$PATH" 2>/dev/null || \
-    echo '{"allowed":false,"reason":"Syntax error in file"}'; exit 2
+FPATH=$(echo "$INPUT" | jq -r '.tool_input.file_path')
+if [[ "$FPATH" == *.py ]]; then
+  if ! python -m py_compile "$FPATH" 2>/dev/null; then
+    echo "Syntax error in $FPATH" >&2
+    exit 2   # blocking; model sees stderr
+  fi
 fi
 ```
 
@@ -575,9 +626,10 @@ fi
 ```bash
 #!/bin/bash
 INPUT=$(cat)
-CONTENT=$(echo "$INPUT" | jq -r '.inputJson.content // .inputJson.command // ""')
+CONTENT=$(echo "$INPUT" | jq -r '.tool_input.content // .tool_input.command // ""')
 if echo "$CONTENT" | grep -qE 'sk-ant-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{36}'; then
-  echo '{"allowed":false,"reason":"Possible secret detected in content"}'; exit 2
+  echo "Possible secret detected in content" >&2
+  exit 2   # blocking
 fi
 ```
 

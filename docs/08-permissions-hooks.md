@@ -210,72 +210,135 @@ Hooks are shell commands that execute at lifecycle events.
 }
 ```
 
+### Hook Execution Environment
+
+Hooks run in **embedded Node.js subprocesses** (`spawn()`), completely separate from the user's terminal. The user never sees hook I/O directly.
+
+| Platform | Shell |
+|----------|-------|
+| Unix/macOS | `/bin/sh` via `spawn(cmd, [], { shell: true })` |
+| Windows | Git Bash (Cygwin) — paths must be POSIX |
+| `shell: 'powershell'` | `pwsh -NoProfile -NonInteractive -Command <cmd>` |
+
 ### Hook Environment Variables
 
-Available in hook commands:
+The subprocess inherits the parent `process.env` plus these injected variables:
 
-| Variable | Available In | Description |
-|----------|-------------|-------------|
-| `CLAUDE_TOOL_NAME` | Pre/PostToolUse | Tool being called |
-| `CLAUDE_TOOL_INPUT` | Pre/PostToolUse | JSON input to tool |
-| `CLAUDE_TOOL_OUTPUT` | PostToolUse | Tool's output |
-| `CLAUDE_FILE_PATH` | Edit/Write hooks | File path being modified |
-| `CLAUDE_SESSION_ID` | All | Current session ID |
-| `CLAUDE_AGENT_ID` | SubagentStop | Sub-agent's ID |
+| Variable | Set When | Description |
+|----------|----------|-------------|
+| `CLAUDE_PROJECT_DIR` | Always | Stable project root (never worktree path; POSIX on Windows) |
+| `CLAUDE_PLUGIN_ROOT` | Plugin/skill hooks | Plugin or skill install path |
+| `CLAUDE_PLUGIN_DATA` | Plugin hooks | Plugin data directory |
+| `CLAUDE_PLUGIN_OPTION_*` | Plugin hooks | Per-option values (e.g. `CLAUDE_PLUGIN_OPTION_API_KEY`) |
+| `CLAUDE_ENV_FILE` | SessionStart/Setup/CwdChanged/FileChanged (bash only) | Path to `.sh` file hook writes `VAR=value` exports into; injected into subsequent bash commands |
+| `CLAUDE_CODE_SHELL_PREFIX` | bash only | Inherited command prefix wrapper |
 
-### Hook Execution Model
+**Note:** Tool context (tool name, input, output) is **not** in env vars — it is sent via stdin JSON.
 
-```typescript
-// hooks.ts
-async function runHooks(
-  event: HookEvent,
-  context: HookContext,
-): Promise<void> {
-  const hooks = getHooksForEvent(event)
-  
-  for (const hookConfig of hooks) {
-    // Check matcher
-    if (hookConfig.matcher && !matchesPattern(hookConfig.matcher, context)) {
-      continue
-    }
-    
-    for (const hook of hookConfig.hooks) {
-      if (hook.type === 'command') {
-        const env = buildHookEnvironment(context)
-        const result = await exec(hook.command, {
-          env,
-          timeout: hook.timeout ?? 60_000,
-        })
-        
-        // Hook output is shown to model as system message
-        if (result.stdout) {
-          yield createSystemMessage({ content: result.stdout })
-        }
-        
-        // Non-zero exit = hook blocked the action
-        if (result.exitCode !== 0) {
-          throw new HookBlockedError(result.stderr)
-        }
-      }
+In GitHub Actions only, secrets are scrubbed from the inherited env (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`, etc.).
+
+#### `CLAUDE_PLUGIN_OPTION_*` — Full Details
+
+Each key in the plugin's saved options is exposed as `CLAUDE_PLUGIN_OPTION_{KEY}` where `{KEY}` is the option key uppercased (e.g. `apiKey` → `CLAUDE_PLUGIN_OPTION_APIKEY`). Key sanitization: `key.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()`. The manifest schema already constrains keys to `/^[A-Za-z_]\w*$/` so this is belt-and-suspenders.
+
+**Storage split at save time** (`pluginOptionsStorage.ts`):
+
+| Option schema `sensitive` | Storage location |
+|--------------------------|-----------------|
+| `false` / absent | `settings.json → pluginConfigs[pluginId].options` |
+| `true` | macOS keychain or `.credentials.json` → `secureStorage.pluginSecrets[pluginId]` |
+
+At load time both are merged (`secureStorage` wins on collision). **Sensitive values ARE included** in `CLAUDE_PLUGIN_OPTION_*` env vars — hooks run user code, same trust boundary as reading the keychain directly.
+
+Options are memoized per-`pluginId` for the session lifetime (cleared by `/reload-plugins` or any settings change).
+
+**Template substitution in hook command strings** — before spawn, the command string is processed for `${user_config.KEY}` references (throws on missing key — plugin authoring bug). In skill/agent prose, `${user_config.KEY}` for a sensitive field renders as a placeholder instead of the real value so secrets don't go into the model context.
+
+**Plugin manifest `userConfig` schema** (field per option):
+
+```json
+{
+  "userConfig": {
+    "apiKey": {
+      "type": "string",
+      "title": "API Key",
+      "description": "Your API key — get one at example.com",
+      "required": true,
+      "sensitive": true
+    },
+    "maxRetries": {
+      "type": "number",
+      "title": "Max Retries",
+      "description": "How many times to retry on failure",
+      "default": 3,
+      "min": 1,
+      "max": 10
+    },
+    "outputDir": {
+      "type": "directory",
+      "title": "Output directory",
+      "description": "Where to write output files"
     }
   }
 }
 ```
 
-### Hook Output to Model
+Supported `type` values: `string`, `number`, `boolean`, `directory`, `file`. The `multiple: true` flag (string type) allows an array of strings.
 
-When a hook produces stdout, it's injected into the conversation as a system message. This allows hooks to communicate with the model:
+### Hook Wire Protocol
 
-```bash
-# This hook output tells Claude there's an issue
-#!/bin/bash
-if git diff --cached | grep -q "TODO"; then
-  echo "WARNING: Committing with TODO comments. Please resolve them first."
-  exit 1
-fi
+**stdin** — single JSON line terminated with `\n`:
+
+```json
+{"session_id":"abc-123","transcript_path":"/abs/path/transcript.jsonl","cwd":"/home/user/project","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status"},"tool_use_id":"toolu_01abc"}
 ```
 
-The model sees: `WARNING: Committing with TODO comments. Please resolve them first.`
+**stdout** — either JSON (if starts with `{`) or plain text:
+
+```json
+{
+  "continue": true,
+  "decision": "approve",
+  "reason": "string shown to user",
+  "systemMessage": "string injected into model context",
+  "suppressOutput": false
+}
+```
+
+Plain text stdout is shown as a message in the transcript.
+
+**Exit code semantics:**
+
+| Code | Behavior |
+|------|----------|
+| `0` | Success. Stdout consumed normally. |
+| `1` | Non-blocking error. Execution continues; stderr shown to user. |
+| `2` | **Blocking.** Action blocked; stderr becomes the block reason shown to user. |
+| `>2` | Same as `1` (non-blocking). |
+
+Note: exit 0 with `{"decision":"block"}` in stdout is also treated as a block.
+
+**Default timeout:** 10 minutes (`TOOL_HOOK_EXECUTION_TIMEOUT_MS`). Per-hook override: `hook.timeout` (seconds). `SessionEnd`/`Stop` default is **1.5 s** (override via `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS`).
+
+### Async Hooks
+
+A hook can background itself by emitting `{"async": true}` as the **first line** of stdout — Claude resumes immediately while the hook continues running. Alternatively set `async: true` or `asyncRewake: true` in config.
+
+- `async: true` — fire-and-forget; exit code ignored
+- `asyncRewake: true` — background hook; if it exits with code `2`, the result is enqueued as a task-notification that wakes the model
+
+### Hook Output to Model
+
+When stdout is plain text, it is injected into the conversation as a system message:
+
+```bash
+#!/bin/bash
+INPUT=$(cat)   # stdin is the authoritative JSON source
+TOOL=$(echo "$INPUT" | jq -r '.tool_name')
+CMD=$(echo "$INPUT" | jq -r '.tool_input.command // "n/a"')
+echo "Audit: [$TOOL] $CMD" >> ~/.agent/audit.log
+# Any echo to stdout here becomes a system message in the conversation
+```
 
 ---
 

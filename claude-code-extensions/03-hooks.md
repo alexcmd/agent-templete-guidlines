@@ -2,6 +2,8 @@
 
 Hooks are shell commands, HTTP requests, LLM prompts, or agent callbacks that run automatically at lifecycle events. They can inspect, modify, approve, or block operations without changing Claude Code's source code.
 
+> **Source-verified against:** `src/utils/hooks.ts`, `src/types/hooks.ts`, `src/schemas/hooks.ts`, `src/utils/hooks/` (execPromptHook, execAgentHook, execHttpHook, sessionHooks, hooksConfigManager)
+
 ---
 
 ## Hook Configuration Location
@@ -33,7 +35,7 @@ Hooks live in the `hooks` key of any settings file:
 
 ## All 27 Hook Events
 
-Sourced from `src/entrypoints/sdk/coreTypes.ts`:
+Sourced from `src/entrypoints/sdk/coreTypes.ts` (HOOK_EVENTS array) and `src/utils/hooks/hooksConfigManager.ts`.
 
 ### Tool Lifecycle
 | Event | When | Can block? |
@@ -104,7 +106,7 @@ Sourced from `src/entrypoints/sdk/coreTypes.ts`:
 
 ### 1. Command Hook (Shell)
 
-Runs a shell command. The hook input is passed as JSON via the `CLAUDE_TOOL_INPUT` env var (or stdin if input is large). Output is read from stdout.
+Runs a shell command. **Hook input arrives as JSON on stdin.** For small inputs, `CLAUDE_TOOL_INPUT` env var is also set as a convenience; always prefer stdin as it handles large payloads.
 
 ```json
 {
@@ -136,10 +138,14 @@ Runs a shell command. The hook input is passed as JSON via the `CLAUDE_TOOL_INPU
 
 Runs the hook input through a small LLM call. Use `$ARGUMENTS` placeholder for the input JSON.
 
+**Only available for:** `PreToolUse`, `PostToolUse`, `PermissionRequest`
+
+The LLM **must** return: `{"ok": true}` (allow) or `{"ok": false, "reason": "..."}` (block).
+
 ```json
 {
   "type": "prompt",
-  "prompt": "The following tool call is about to run: $ARGUMENTS\n\nDoes this look safe? Respond with JSON: {\"decision\": \"approve\"} or {\"decision\": \"block\", \"reason\": \"...\"} ",
+  "prompt": "The following tool call is about to run:\n$ARGUMENTS\n\nIs this safe? Respond ONLY with JSON: {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}",
   "if": "Bash",
   "model": "claude-haiku-4-5-20251001",
   "timeout": 30,
@@ -154,13 +160,15 @@ Runs the hook input through a small LLM call. Use `$ARGUMENTS` placeholder for t
 | `prompt` | string | required | Prompt text. Use `$ARGUMENTS` for input JSON. |
 | `if` | string | — | Permission rule filter |
 | `model` | string | fast model | Override model for this hook |
-| `timeout` | number | 60s | Timeout in seconds |
+| `timeout` | number | 30s | Timeout in seconds |
 | `statusMessage` | string | — | Custom spinner message |
 | `once` | bool | `false` | Remove hook after first execution |
 
 ### 3. HTTP Hook
 
 POSTs the hook input JSON to an endpoint. Reads response body as hook output.
+
+**Not supported for:** `SessionStart`, `Setup`
 
 ```json
 {
@@ -185,18 +193,24 @@ POSTs the hook input JSON to an endpoint. Reads response body as hook output.
 | `if` | string | — | Permission rule filter |
 | `headers` | object | — | HTTP headers. Values can reference `$ENV_VAR` syntax. |
 | `allowedEnvVars` | string[] | — | Env vars that may be interpolated in headers. **Required** for env var expansion to work. |
-| `timeout` | number | 60s | Timeout in seconds |
+| `timeout` | number | 600s | Timeout in seconds (10 minutes default) |
 | `statusMessage` | string | — | Custom spinner message |
 | `once` | bool | `false` | Remove hook after first execution |
 
+**Security:** URL must be in `allowedHttpHookUrls` setting (enterprise). Header values are sanitized to prevent CRLF injection. Resolved IPs are SSRF-guarded unless a proxy is configured.
+
 ### 4. Agent Hook (Agentic Verifier)
 
-Spawns a mini-agent to verify/evaluate the hook event. Use `$ARGUMENTS` placeholder for input.
+Spawns a full multi-turn sub-agent to verify/evaluate the hook event. Has access to all tools except nested agent spawning and Stop hooks. Max 50 turns.
+
+**Only available for:** `PreToolUse`, `PostToolUse`, `PermissionRequest`
+
+The agent **must** return: `{"ok": true}` (allow) or `{"ok": false, "reason": "..."}`.
 
 ```json
 {
   "type": "agent",
-  "prompt": "Verify that the bash command $ARGUMENTS does not contain any destructive operations like rm -rf, format, or DROP TABLE.",
+  "prompt": "Verify that the bash command:\n$ARGUMENTS\n...does not contain destructive operations like rm -rf, format, or DROP TABLE.\nRespond with: {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}",
   "if": "Bash",
   "model": "claude-haiku-4-5-20251001",
   "timeout": 60,
@@ -217,34 +231,65 @@ Spawns a mini-agent to verify/evaluate the hook event. Use `$ARGUMENTS` placehol
 
 ---
 
+## Exit Codes (command hooks)
+
+Exit codes are the primary control mechanism for command hooks:
+
+| Code | Name | Behavior |
+|------|------|----------|
+| `0` | Success | Hook passed. Stdout shown to user (unless `suppressOutput: true` in JSON). |
+| `2` | Blocking error | Hook **blocks** the action. Stderr shown to the **model** as context. JSON on stdout is parsed for `hookSpecificOutput`. |
+| Any other | Non-blocking error | Hook failed but action is **not blocked**. Stderr shown to the **user** only (not model). |
+
+**Critical distinction:** exit code `2` sends stderr to the **model**; non-zero codes send stderr to the **user**. Use `2` when you want the model to know why it was blocked.
+
+```bash
+#!/usr/bin/env bash
+# Exit 2 = blocking: model sees stderr
+echo "Blocked: rm -rf is not allowed" >&2
+exit 2
+
+# Exit 1 = warning: user sees stderr, action proceeds
+echo "Warning: no tests found" >&2
+exit 1
+```
+
+---
+
 ## Matcher and `if` Field
 
 ### Matcher
 
-The `matcher` field at the `HookMatcher` level is a string pattern applied to the primary value associated with each event:
-- For tool hooks: the tool name (e.g., `"Bash"`, `"Write"`)
-- Partial string match (not glob): `"Bash"` matches `Bash` tool; `"Write"` matches `Write` tool
+The `matcher` field at the `HookMatcher` level filters which events trigger the hook group. The matched field varies by event type:
+
+| Event(s) | Matched field |
+|----------|---------------|
+| `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`, `PermissionDenied` | `tool_name` |
+| `SessionStart`, `ConfigChange`, `InstructionsLoaded` | `source` |
+| `Setup`, `PreCompact`, `PostCompact` | `trigger` |
+| `Notification` | `notification_type` |
+| `SessionEnd` | `reason` |
+| `StopFailure` | `error` |
+| `SubagentStart`, `SubagentStop` | `agent_type` |
+| `Elicitation`, `ElicitationResult` | `mcp_server_name` |
+| `FileChanged` | `basename(file_path)` |
+| `TeammateIdle`, `TaskCreated`, `TaskCompleted` | (no matcher — always fires) |
+
+Matching is **case-insensitive substring** (pipe-separated for OR):
 
 ```json
 {
   "PreToolUse": [
-    {
-      "matcher": "Bash",
-      "hooks": [...]
-    },
-    {
-      "matcher": "Write",
-      "hooks": [...]
-    }
+    { "matcher": "Bash",         "hooks": [...] },
+    { "matcher": "Write|Edit",   "hooks": [...] },
+    { "matcher": "",             "hooks": [...] }   // empty = all tools
   ]
 }
 ```
 
-Omitting `matcher` (or setting it to `""`) applies the hook to ALL events of that type.
-
 ### `if` Condition
 
-The `if` field inside each individual hook uses **permission rule syntax** — the same syntax as `permissions.allow`:
+The `if` field inside each individual hook uses **permission rule syntax** — the same syntax as `permissions.allow`. Evaluated before spawning the process:
 
 ```
 "Bash(git *)"           # Only when Bash runs commands starting with 'git'
@@ -255,48 +300,87 @@ The `if` field inside each individual hook uses **permission rule syntax** — t
 "mcp__my-server__*"     # Any tool from my-server MCP
 ```
 
-The `if` condition is evaluated before spawning the hook process, avoiding the overhead of launching a process for non-matching calls.
+`if` is supported for: `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`
 
 ---
 
-## Hook Input Data (stdin / env)
+## Hook Input Data (stdin)
 
-Hooks receive input as JSON either via `CLAUDE_TOOL_INPUT` environment variable (small inputs) or stdin (large inputs). Structure depends on the event:
+Hooks receive a JSON object on stdin. The structure varies by event type.
 
-### PreToolUse / PostToolUse / PostToolUseFailure
+### Common Fields (all events)
+
 ```json
 {
   "session_id": "abc123",
   "hook_event_name": "PreToolUse",
+  "transcript_path": "/tmp/claude-sessions/abc123/transcript.jsonl",
+  "cwd": "/home/user/myproject",
+  "permission_mode": "ask"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `session_id` | Unique session identifier |
+| `hook_event_name` | The event name (string) |
+| `transcript_path` | Path to JSONL transcript of the current session |
+| `cwd` | Current working directory |
+| `permission_mode` | Current permission mode: `"ask"` / `"auto"` / `"dontAsk"` |
+
+### PreToolUse / PostToolUse / PostToolUseFailure
+
+```json
+{
+  "session_id": "abc123",
+  "hook_event_name": "PreToolUse",
+  "transcript_path": "/tmp/claude-sessions/abc123/transcript.jsonl",
+  "cwd": "/home/user/project",
+  "permission_mode": "ask",
   "tool_name": "Bash",
   "tool_input": {
     "command": "git status"
-  }
+  },
+  "tool_use_id": "toolu_01abc",
+  "agent_id": "subagent-xyz",       // only for sub-agent tool calls
+  "agent_type": "explore"           // only for sub-agent tool calls
 }
 ```
 
 ### UserPromptSubmit
+
 ```json
 {
   "session_id": "abc123",
   "hook_event_name": "UserPromptSubmit",
+  "transcript_path": "...",
+  "cwd": "/home/user/project",
+  "permission_mode": "ask",
   "message": "User's message text"
 }
 ```
 
 ### SessionStart
+
 ```json
 {
   "session_id": "abc123",
-  "hook_event_name": "SessionStart"
+  "hook_event_name": "SessionStart",
+  "transcript_path": "...",
+  "cwd": "/home/user/project",
+  "permission_mode": "ask"
 }
 ```
 
 ### PermissionRequest
+
 ```json
 {
   "session_id": "abc123",
   "hook_event_name": "PermissionRequest",
+  "transcript_path": "...",
+  "cwd": "/home/user/project",
+  "permission_mode": "ask",
   "tool_name": "Bash",
   "tool_input": { "command": "rm -rf build/" },
   "permission_request": { "message": "Allow rm?" }
@@ -304,10 +388,14 @@ Hooks receive input as JSON either via `CLAUDE_TOOL_INPUT` environment variable 
 ```
 
 ### FileChanged
+
 ```json
 {
   "session_id": "abc123",
   "hook_event_name": "FileChanged",
+  "transcript_path": "...",
+  "cwd": "/home/user/project",
+  "permission_mode": "ask",
   "file_path": "/absolute/path/to/changed/file.ts"
 }
 ```
@@ -316,32 +404,45 @@ Hooks receive input as JSON either via `CLAUDE_TOOL_INPUT` environment variable 
 
 ## Hook Output (stdout)
 
-Hooks communicate back to Claude Code via JSON on stdout. Empty output or non-JSON output = success with no action.
+Hooks communicate back to Claude Code via JSON on stdout.
+
+> **JSON parsing rule:** stdout is only parsed as JSON if it **starts with `{`**. Any other output is treated as plain text. Empty output = success with no action.
 
 ### Universal Fields
+
 ```json
 {
   "continue": true,           // false = stop Claude after this hook
   "suppressOutput": false,    // true = hide hook stdout from transcript
   "stopReason": "...",        // Message shown when continue=false
-  "decision": "approve",      // 'approve' | 'block' (for blocking hooks)
+  "decision": "approve",      // 'approve' | 'block' (legacy; prefer hookSpecificOutput)
   "reason": "Explanation",    // Reason for decision
-  "systemMessage": "Warning"  // Warning shown to user
+  "systemMessage": "Warning"  // Warning shown in UI
 }
 ```
 
+**Blocking logic (priority order):**
+1. `hookSpecificOutput.permissionDecision == "deny"` (PreToolUse)
+2. `decision == "block"` in root JSON
+3. Exit code `2`
+
+Any of these blocks the action. `decision: "block"` with exit code `0` works the same as exit code `2`.
+
 ### Async Hook (deferred response)
+
 ```json
 {
   "async": true,
   "asyncTimeout": 300
 }
 ```
-When `asyncRewake: true` in hook config and hook exits with code 2, the model wakes up.
+
+Emit this as the **first line** of stdout to move the hook to the background immediately.
 
 ### Per-Event `hookSpecificOutput`
 
 #### PreToolUse
+
 ```json
 {
   "hookSpecificOutput": {
@@ -355,6 +456,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### PostToolUse
+
 ```json
 {
   "hookSpecificOutput": {
@@ -366,6 +468,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### UserPromptSubmit
+
 ```json
 {
   "hookSpecificOutput": {
@@ -376,6 +479,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### SessionStart
+
 ```json
 {
   "hookSpecificOutput": {
@@ -388,6 +492,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### Setup
+
 ```json
 {
   "hookSpecificOutput": {
@@ -398,6 +503,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### SubagentStart
+
 ```json
 {
   "hookSpecificOutput": {
@@ -408,6 +514,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### PermissionRequest
+
 ```json
 {
   "hookSpecificOutput": {
@@ -419,20 +526,22 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
     }
   }
 }
-// OR
+```
+
+```json
 {
   "hookSpecificOutput": {
     "hookEventName": "PermissionRequest",
     "decision": {
       "behavior": "deny",
-      "message": "This command is not allowed",
-      "interrupt": false
+      "message": "This command is not allowed"
     }
   }
 }
 ```
 
 #### PermissionDenied
+
 ```json
 {
   "hookSpecificOutput": {
@@ -443,6 +552,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### Elicitation / ElicitationResult
+
 ```json
 {
   "hookSpecificOutput": {
@@ -454,6 +564,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### CwdChanged / FileChanged
+
 ```json
 {
   "hookSpecificOutput": {
@@ -464,16 +575,18 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 ```
 
 #### WorktreeCreate
+
 ```json
 {
   "hookSpecificOutput": {
     "hookEventName": "WorktreeCreate",
-    "worktreePath": "/path/to/new/worktree"   // Always included by runtime
+    "worktreePath": "/path/to/new/worktree"   // Provided by runtime
   }
 }
 ```
 
 #### Notification
+
 ```json
 {
   "hookSpecificOutput": {
@@ -481,6 +594,26 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
     "additionalContext": "Extra context about this notification"
   }
 }
+```
+
+---
+
+## Environment Variables Available to Hooks
+
+| Variable | Available for | Description |
+|----------|--------------|-------------|
+| `CLAUDE_PROJECT_DIR` | All hooks | Project root directory |
+| `CLAUDE_TOOL_INPUT` | Command hooks (small payloads) | Hook input JSON as convenience copy of stdin |
+| `CLAUDE_ENV_FILE` | `SessionStart`, `Setup`, `CwdChanged`, `FileChanged` | Path to a `.sh` file; write `export VAR=value` lines here to inject env vars into subsequent bash commands |
+| `CLAUDE_PLUGIN_ROOT` | Hooks inside plugins | Plugin directory |
+| `CLAUDE_PLUGIN_DATA` | Hooks inside plugins | Plugin data directory |
+| `CLAUDE_PLUGIN_OPTION_<KEY>` | Hooks inside plugins | Plugin config option (key uppercased + sanitized) |
+
+**`CLAUDE_ENV_FILE` example** — hook sets an environment variable for the session:
+```bash
+#!/usr/bin/env bash
+# SessionStart hook: export tool version for use in later commands
+echo "export MY_TOOL_VERSION=2.0" >> "$CLAUDE_ENV_FILE"
 ```
 
 ---
@@ -503,7 +636,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
           },
           {
             "type": "agent",
-            "prompt": "Evaluate if this bash command is safe: $ARGUMENTS. Respond approve or block.",
+            "prompt": "Evaluate if this bash command is safe:\n$ARGUMENTS\nRespond: {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}",
             "if": "Bash(sudo *)",
             "model": "claude-haiku-4-5-20251001",
             "timeout": 30
@@ -529,7 +662,7 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
         "hooks": [
           {
             "type": "command",
-            "command": "npx prettier --write \"$CLAUDE_TOOL_INPUT_PATH\" 2>/dev/null || true",
+            "command": "npx prettier --write \"$(echo $CLAUDE_TOOL_INPUT | jq -r '.tool_input.file_path')\" 2>/dev/null || true",
             "if": "Write(**.ts)",
             "async": true
           }
@@ -566,46 +699,37 @@ When `asyncRewake: true` in hook config and hook exits with code 2, the model wa
 
 ## Writing Hook Scripts
 
-### Python Example (command hook with JSON output)
+### Python Example — PreToolUse blocker with JSON output
 
 ```python
 #!/usr/bin/env python3
 import json
-import os
 import sys
 
-# Read hook input
-hook_input_json = os.environ.get('CLAUDE_TOOL_INPUT', '')
-if not hook_input_json:
-    hook_input_json = sys.stdin.read()
+# Always read from stdin — handles large payloads that don't fit in env var
+hook_input = json.loads(sys.stdin.read() or "{}")
 
-try:
-    hook_input = json.loads(hook_input_json)
-except json.JSONDecodeError:
-    hook_input = {}
+tool_name = hook_input.get("tool_name", "")
+tool_input = hook_input.get("tool_input", {})
 
-tool_name = hook_input.get('tool_name', '')
-tool_input = hook_input.get('tool_input', {})
-
-# Example: block dangerous rm commands
-if tool_name == 'Bash':
-    command = tool_input.get('command', '')
-    if 'rm -rf /' in command:
-        output = {
+if tool_name == "Bash":
+    command = tool_input.get("command", "")
+    if "rm -rf /" in command:
+        # Exit 2 = blocking; stderr goes to MODEL as context
+        print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
                 "permissionDecisionReason": "Refusing to delete root filesystem"
             }
-        }
-        print(json.dumps(output))
-        sys.exit(0)
+        }))
+        sys.exit(0)  # JSON output handles the block; exit 2 also works
 
-# Allow by default (empty output = success)
+# Allow by default
 sys.exit(0)
 ```
 
-### Shell Example (inject git context at session start)
+### Shell Example — inject git context at session start
 
 ```bash
 #!/usr/bin/env bash
@@ -616,7 +740,7 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
     BRANCH=$(git branch --show-current)
     LAST_COMMIT=$(git log --oneline -1)
     CHANGED=$(git diff --name-only HEAD | head -20)
-    
+
     cat << EOF
 {
   "hookSpecificOutput": {
@@ -628,46 +752,46 @@ EOF
 fi
 ```
 
-### Node.js Example (async HTTP audit hook)
+### Node.js Example — async HTTP audit hook
 
 ```javascript
 #!/usr/bin/env node
-const input = JSON.parse(process.env.CLAUDE_TOOL_INPUT || '{}');
+let raw = "";
+process.stdin.on("data", d => raw += d);
+process.stdin.on("end", () => {
+  const input = JSON.parse(raw || "{}");
 
-// Fire-and-forget audit log
-fetch('https://audit.example.com/log', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    timestamp: new Date().toISOString(),
-    event: input.hook_event_name,
-    tool: input.tool_name,
-    input: input.tool_input,
-    session: input.session_id
-  })
-}).catch(() => {}); // Never fail the hook
+  fetch("https://audit.example.com/log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: input.hook_event_name,
+      tool: input.tool_name,
+      input: input.tool_input,
+      session: input.session_id
+    })
+  }).catch(() => {}); // Never fail the hook
 
-// Exit immediately (async: true in config handles non-blocking)
-process.exit(0);
+  process.exit(0);
+});
 ```
 
 ---
 
 ## Hook Execution Order
 
-When multiple hooks match the same event:
-1. All matching matchers for the event are evaluated
-2. Within a matcher, hooks execute sequentially
-3. Multiple matchers execute in config order
-4. `decision: block` from any hook stops subsequent hooks for that event
-
-For `async: true` hooks, they run concurrently in background and don't affect the execution order of non-async hooks.
+1. All matcher groups for the event are evaluated in config order
+2. Within a matcher, hooks execute **sequentially**
+3. `decision: "block"` or exit code `2` from any hook stops all subsequent hooks for that event
+4. `async: true` hooks run concurrently in background and don't block the main sequence
+5. **Deduplication:** hooks with identical `{command, shell, if}` (or `{prompt, if}` / `{url, if}`) from the same source are deduplicated and run only once per event
 
 ---
 
 ## asyncRewake Pattern
 
-The `asyncRewake` pattern allows a background process to wake up the model:
+Lets a background process wake the model after it finishes:
 
 ```json
 {
@@ -677,22 +801,36 @@ The `asyncRewake` pattern allows a background process to wake up the model:
 }
 ```
 
-In the hook script:
 ```bash
 #!/usr/bin/env bash
-# Run tests in background, wake model if they fail
+# Run tests in background; wake model if they fail
 npm test > /tmp/test-results.txt 2>&1
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
-    # Exit code 2 = wake the model
-    echo '{"systemMessage": "Tests failed! See /tmp/test-results.txt"}'
-    exit 2
+    echo '{"systemMessage": "Tests failed! See /tmp/test-results.txt"}' >&1
+    exit 2   # exit 2 = enqueue a wake notification to the model
 fi
 exit 0
 ```
 
-Exit codes:
-- `0` — Success, no action
-- `1` — Non-blocking error (logged, hook continues)
-- `2` (with `asyncRewake`) — Wake the model with optional output
+**asyncRewake exit code semantics:**
+- `0` — background job succeeded; no wake
+- `2` — wake the model (stdout JSON forwarded as notification context)
+- Other — logged, no wake
+
+---
+
+## Session-End Hook Timeout
+
+`SessionEnd` / `Stop` hooks have a **very short** default timeout of **1.5 seconds** (not 60s). Override with:
+
+```bash
+export CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=5000  # 5 seconds
+```
+
+This is intentional — Claude Code exits quickly after the session ends.
+
+---
+
+*[← Custom Agents](02-agents.md) | [Next: Plugins →](04-plugins.md)*

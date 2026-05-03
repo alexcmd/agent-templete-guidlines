@@ -459,3 +459,123 @@ if (caps.supportsConditionalBreakpoints) {
 - [ ] Handle `stopped` events asynchronously — inject as context for the agent's next turn
 - [ ] Timeout all DAP requests at 10s; return error, don't block agent loop
 - [ ] Graceful disconnect with `terminateDebuggee: true` on session end
+
+---
+
+## §7 — Claude Code Source Architecture: DAP Integration Map
+
+> Source-verified analysis of `/home/deck/Projects/claude-code/src` (2026-05-03).
+> Maps the internal hook points where a DAP server would attach if you were building
+> it inside Claude Code. Use this as a blueprint when modifying the source, or as
+> architecture context when building external plugins (see `05-dap-claude-code-plugin.md`).
+
+### Architecture Layers
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  entrypoints/                                                   │
+│    mcp.ts          ← DAP server entry point would go here      │
+│    cli.tsx         ← Add --dap-port flag here                   │
+├─────────────────────────────────────────────────────────────────┤
+│  services/                                                      │
+│    tools/toolExecution.ts   ← inject breakpoint checks here    │
+│    lsp/LSPClient.ts         ← exact structural template for DAP │
+├─────────────────────────────────────────────────────────────────┤
+│  Tool.ts                                                        │
+│    ToolUseContext (line 158) ← maps to DAP scopes/variables     │
+│    ToolProgress   (line 307) ← maps to DAP output/stopped events│
+├─────────────────────────────────────────────────────────────────┤
+│  bridge/                                                        │
+│    sessionRunner.ts (line 335) ← subprocess spawn pattern      │
+│    bridgeMain.ts               ← DAP-over-bridge option         │
+├─────────────────────────────────────────────────────────────────┤
+│  QueryEngine.ts (line 209)                                      │
+│    submitMessage() generator  ← main agent loop, tool dispatch  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### LSP as the DAP Template
+
+`services/lsp/LSPClient.ts` already uses the exact same protocol stack as DAP
+(JSON-RPC over stdio via `vscode-jsonrpc`). DAP is a structural clone:
+
+```
+LSPClient.ts                       DAPClient.ts (proposed)
+─────────────────────────────────────────────────────────
+spawn(lspBin, args, {stdio})   →   spawn(adapterBin, args, {stdio})
+createMessageConnection(        →   createMessageConnection(
+  StreamMessageReader(stdout),        StreamMessageReader(stdout),
+  StreamMessageWriter(stdin)          StreamMessageWriter(stdin)
+)                                  )
+connection.sendRequest(method)  →   connection.sendRequest('launch', ...)
+connection.onNotification(...)  →   connection.onNotification('stopped', ...)
+```
+
+The `vscode-languageserver-protocol` package (already a transitive dep via LSP)
+ships DAP type definitions. No new transport code needed.
+
+### Tool Execution Flow and DAP Injection Points
+
+```
+QueryEngine.submitMessage()        [QueryEngine.ts:209]
+  ↓
+Claude returns tool_use blocks
+  ↓
+toolExecution.ts:150+              ← BREAKPOINT CHECK here (PreToolUse)
+  ├─ canUseTool() permission gate
+  ├─ pre-tool hooks run
+  ├─ tool.call(input, ToolUseContext)   ← ToolUseContext = DAP variables scope
+  │     ↓
+  │   progress callbacks fire      ← emit DAP `output` / `stopped` events
+  │     ↓
+  │   ToolResult returned
+  ├─ post-tool hooks run            ← BREAKPOINT CHECK here (PostToolUse)
+  └─ result injected into messages
+```
+
+### Key Type Mappings (DAP ↔ Claude Code Internals)
+
+| DAP Concept | Claude Code equivalent | File:line |
+|---|---|---|
+| Launch/attach | `sessionRunner.spawn()` | `bridge/sessionRunner.ts:335` |
+| Scope | `ToolUseContext` fields | `Tool.ts:158-300` |
+| Variable | `ToolUseContext.readFileState`, `getAppState()` | `Tool.ts:175-210` |
+| Stopped event | `ToolCallProgress` callback | `Tool.ts:307-320` |
+| Output event | `toolCallProgress({type:'bash_progress'})` | `Tool.ts:315` |
+| Thread | `tool_use_id` (parallel tool calls) | `toolExecution.ts:150` |
+| Stack frame | Sequence of tool calls in `QueryEngine` turn | `QueryEngine.ts:209` |
+| Evaluate | `canUseTool` + ad-hoc `tool.call()` | `services/tools/toolExecution.ts` |
+
+### Proposed New Files (Source Modification Path)
+
+```
+src/
+  entrypoints/dap.ts            ← DAPServer entry (mirror mcp.ts)
+  services/dap/
+    DAPServer.ts                ← protocol handler (mirror LSPClient.ts)
+    breakpointRegistry.ts       ← per-session breakpoint storage
+    variableInspector.ts        ← ToolUseContext → DAP Variable serializer
+  tools/DAPDebugTool/
+    DAPDebugTool.ts             ← expose debug ops as Claude tool
+```
+
+**Files to modify:**
+
+| File | Change | Why |
+|---|---|---|
+| `services/tools/toolExecution.ts:150` | inject `checkBreakpoint()` before/after `tool.call()` | pause on breakpoint hits |
+| `Tool.ts:158` | add `debugMeta?: DebugContext` to `ToolUseContext` | carry DAP frame ID |
+| `bridge/sessionRunner.ts:335` | add `--dap-port` passthrough to spawned process | remote session debugging |
+| `entrypoints/cli.tsx` | add `--dap-port N` flag | activate DAP server mode |
+| `tools.ts:193` | register `DAPDebugTool` when `DAP_MODE=1` | expose tool to Claude |
+
+### External Integration Alternative
+
+If modifying the source is not an option, all of the above can be approximated
+using only MCP + hooks from outside. See
+[05-dap-claude-code-plugin.md](05-dap-claude-code-plugin.md) for the complete
+zero-source-change implementation guide.
+
+---
+
+*[← 05-web-integration.md](05-web-integration.md) | [External Plugin Guide →](05-dap-claude-code-plugin.md)*
